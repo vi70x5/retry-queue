@@ -258,34 +258,14 @@ jobs:
                 -d "{\"id\": \"${HEARTBEAT_ID}\", \"expiresAt\": \"${EXPIRES_AT}\"}" 2>/dev/null || echo "000")
               if [ "$HTTP_CODE" = "404" ]; then
                 echo "⚠️ Proxy record lost, re-registering..."
-                # Rebuild registration JSON and re-post
+                # Rebuild registration JSON using printf (safer than nested heredocs)
                 CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
                 if [ "${{ github.event.inputs.protocol }}" == "hysteria2" ] || [ -z "${{ github.event.inputs.protocol }}" ]; then
-                  cat > /tmp/reregister.json <<EOF
-              {
-                "protocol": "hysteria2",
-                "id": "${HEARTBEAT_ID}",
-                "host": "${HOST}",
-                "port": 443,
-                "password": "${{ steps.creds.outputs.password }}",
-                "sni": "${HOST}",
-                "createdAt": "${CREATED_AT}",
-                "expiresAt": "${EXPIRES_AT}"
-              }
-              EOF
+                  printf '{"protocol":"hysteria2","id":"%s","host":"%s","port":443,"password":"${{ steps.creds.outputs.password }}","sni":"%s","createdAt":"%s","expiresAt":"%s"}\n' \
+                    "${HEARTBEAT_ID}" "${HOST}" "${HOST}" "${CREATED_AT}" "${EXPIRES_AT}" > /tmp/reregister.json
                 elif [ "${{ github.event.inputs.protocol }}" == "vless" ]; then
-                  cat > /tmp/reregister.json <<EOF
-              {
-                "protocol": "vless",
-                "id": "${HEARTBEAT_ID}",
-                "host": "${HOST}",
-                "port": 443,
-                "uuid": "${{ steps.creds.outputs.uuid }}",
-                "sni": "${HOST}",
-                "createdAt": "${CREATED_AT}",
-                "expiresAt": "${EXPIRES_AT}"
-              }
-              EOF
+                  printf '{"protocol":"vless","id":"%s","host":"%s","port":443,"uuid":"${{ steps.creds.outputs.uuid }}","sni":"%s","createdAt":"%s","expiresAt":"%s"}\n' \
+                    "${HEARTBEAT_ID}" "${HOST}" "${HOST}" "${CREATED_AT}" "${EXPIRES_AT}" > /tmp/reregister.json
                 fi
                 curl -s -X POST "${COORDINATOR_URL}/register" \
                   -H "Content-Type: application/json" \
