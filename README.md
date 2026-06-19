@@ -438,7 +438,6 @@ Full details in `docs/SPEC-V2-MESH.md` §8.
 12. **☯️ 阴阳平衡.** Every layer needs both centralized structure and decentralized resilience. Bootstrap = yang. DHT = yin. Authorization = balanced. Defection defense = yang inside yin. *(DeepSeek.)*
 13. **💀 Serial multi-hop is dead.** Killed by consensus of 6 AIs. Removed from schema. Parallel multiplexing (主轨+暗轨) is the resilience model. *(GLM 5.1: "Remove `route: []` — it's code debt violating YAGNI.")*
 14. **🚂 Client retry = 70% of viability.** Architecture is 30%. Clients must implement relentless degradation: 1 fail → probe, 3 fails → dead + resubscribe. *(GLM 5.1.)*
-15. **🔀 Multi-repo strategy required.** GHA free tier limits per-repo concurrency to 2-3 jobs. Use a pool of fork repos to trigger runners. *(GLM 5.1.)*
 
 ---
 
