@@ -417,7 +417,6 @@ What stops a node from going rogue? Fake configs, traffic logging, Sybil flood. 
 - *"Immortal liquidity through constant death."* — Kimi 2.6
 - *"Client fault-tolerance is 70% of viability. Architecture is 30%."* — GLM 5.1
 - *"Serial multi-hop is dead. Killed by this consillium."* — GLM 5.1 + Gemini + Kimi 2.6
-- *"GHA's free tier limits per-repo concurrency to 2-3. Use a pool of fork repos to bypass."* — GLM 5.1
 
 Full details in `docs/SPEC-V2-MESH.md` §8.
 
