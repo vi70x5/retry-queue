@@ -31,45 +31,30 @@ jobs:
         if: github.event.inputs.protocol == 'hysteria2' || github.event.inputs.protocol == ''
         run: |
           echo "📦 Installing Hysteria2..."
-          # Download directly from GitHub releases (install script is down)
-          # Use known good version as fallback
-          HY2_VERSION="${HY2_VERSION:-v2.5.0}"
-          HY2_URL="https://github.com/apernet/hysteria/releases/download/${HY2_VERSION}/hysteria-linux-amd64"
+          # Fetch latest release URL from GitHub API
+          HY2_URL=$(curl -sL https://api.github.com/repos/apernet/hysteria/releases/latest \
+            | grep -o '"browser_download_url": *"[^"]*hysteria-linux-amd64"' \
+            | grep -v avx | head -1 | sed 's/.*: *"\(.*\)"$/\1/')
+          if [ -z "$HY2_URL" ]; then
+            # Fallback to known good version
+            HY2_URL="https://github.com/apernet/hysteria/releases/download/app/v2.9.2/hysteria-linux-amd64"
+          fi
           echo "Downloading from: $HY2_URL"
-
-          wget -q --show-progress "${HY2_URL}.tar.gz" -O /tmp/hysteria.tar.gz 2>/dev/null || \
-          wget -q --show-progress "${HY2_URL}.tar.xz" -O /tmp/hysteria.tar.xz 2>/dev/null || \
-          wget -q --show-progress "https://github.com/apernet/hysteria/releases/download/app/v2/hysteria-linux-amd64.tar.gz" -O /tmp/hysteria.tar.gz
-
-          # Try to extract
-          mkdir -p /tmp/hysteria-extract
-          tar -xzf /tmp/hysteria.tar.gz -C /tmp/hysteria-extract/ 2>/dev/null || \
-          tar -xJf /tmp/hysteria.tar.xz -C /tmp/hysteria-extract/ 2>/dev/null || {
-            echo "⚠️ Tar extraction failed, trying direct binary..."
-            wget -q "https://github.com/apernet/hysteria/releases/download/app/v2/hysteria-linux-amd64" -O /tmp/hysteria-extract/hysteria
-          }
-
-          # Find and install the binary
-          find /tmp/hysteria-extract -name "hysteria" -type f -exec sudo cp {} /usr/local/bin/hysteria \;
-          sudo chmod +x /usr/local/bin/hysteria
+          wget -q "$HY2_URL" -O /tmp/hysteria && chmod +x /tmp/hysteria && sudo mv /tmp/hysteria /usr/local/bin/hysteria
           hysteria version || echo "⚠️ Hysteria2 version check failed but binary may still work"
 
       - name: Install sing-box (VLESS)
         if: github.event.inputs.protocol == 'vless'
         run: |
           echo "📦 Installing sing-box..."
-          # Use known good version as fallback
-          SINGBOX_VERSION="${SINGBOX_VERSION:-v1.10.0}"
-          SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION#v}-linux-amd64.tar.gz"
+          SINGBOX_URL=$(curl -sL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -o '"browser_download_url": *"[^"]*linux-amd64[^"]*\.tar\.gz"' \
+            | head -1 | sed 's/.*: *"\(.*\)"$/\1/')
+          if [ -z "$SINGBOX_URL" ]; then
+            SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v1.10.0/sing-box-1.10.0-linux-amd64.tar.gz"
+          fi
           echo "Downloading from: $SINGBOX_URL"
-
-          wget -q --show-progress "$SINGBOX_URL" -O /tmp/sing-box.tar.gz || {
-            echo "Getting from GitHub release..."
-            LATEST_URL=$(curl -s -L https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -o '"browser_download_url": *"[^"]*linux-amd64[^"]*"' | head -1 | sed "s/.*: \"\(.*\)\"$/\1/")
-            wget -q --show-progress "$LATEST_URL" -O /tmp/sing-box.tar.gz
-          }
-
-          # Extract and install
+          wget -q "$SINGBOX_URL" -O /tmp/sing-box.tar.gz
           mkdir -p /tmp/sing-box-extract
           tar -xzf /tmp/sing-box.tar.gz -C /tmp/sing-box-extract/
           find /tmp/sing-box-extract -name "sing-box" -type f -exec sudo cp {} /usr/local/bin/sing-box \;
