@@ -12,13 +12,14 @@ on:
           - vless
           - hysteria2
       tunnel:
-        description: "Tunnel provider (Bore is raw TCP, TryCloudflare is HTTP/WS)"
+        description: "Tunnel provider (Bore is raw TCP, TryCloudflare is HTTP/WS, Direct is P2P NAT punching)"
         required: true
         default: "bore"
         type: choice
         options:
           - bore
           - trycloudflare
+          - direct
 
 env:
   COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
@@ -199,6 +200,39 @@ jobs:
             exit 1
           fi
 
+      # --- Step 5c: Setup Direct P2P UDP NAT Hole Punching ---
+      - name: Setup Direct P2P Tunnel
+        if: github.event.inputs.tunnel == 'direct'
+        run: |
+          echo "🌐 Resolving NAT Mapping with STUN for Direct P2P..."
+          # Run the STUN punch script from the same port as our proxy
+          PUNCH_OUTPUT=$(python3 scripts/stun_punch.py ${{ steps.creds.outputs.port }} 2>/dev/null || echo "FAILED")
+          echo "Punch Output: $PUNCH_OUTPUT"
+
+          if [ "$PUNCH_OUTPUT" == "FAILED" ] || [ -z "$PUNCH_OUTPUT" ]; then
+            echo "⚠️ STUN Resolution Failed! Checking alternate STUN servers..."
+            PUNCH_OUTPUT=$(python3 -c "
+import sys
+sys.path.append('scripts')
+import stun_punch as sp
+mapping = sp.get_stun_mapping(${{ steps.creds.outputs.port }}, 'stun.3cx.com')
+if mapping: print(f'{mapping[0]}:{mapping[1]}')
+else: print('FAILED')
+" 2>/dev/null || echo "FAILED")
+          fi
+
+          if [ "$PUNCH_OUTPUT" == "FAILED" ] || [ -z "$PUNCH_OUTPUT" ]; then
+            echo "❌ All STUN servers failed. Direct P2P is not possible on this network."
+            exit 1
+          fi
+
+          STUN_IP=$(echo "$PUNCH_OUTPUT" | cut -d':' -f1)
+          STUN_PORT=$(echo "$PUNCH_OUTPUT" | cut -d':' -f2)
+
+          echo "TUNNEL_HOST=$STUN_IP" >> $GITHUB_ENV
+          echo "TUNNEL_PORT=$STUN_PORT" >> $GITHUB_ENV
+          echo "🌍 Direct P2P Endpoint: $STUN_IP:$STUN_PORT"
+
       # --- Step 5.7: Calculate expiry time ---
       - name: Calculate expiry time
         run: |
@@ -302,12 +336,19 @@ jobs:
       # --- Step 8: Keep alive with heartbeat ---
       - name: Keep runner alive with heartbeat
         run: |
-          echo "💤 Keeping alive with heartbeat every 5 min..."
+          echo "💤 Keeping alive with heartbeat..."
           HEARTBEAT_ID="gha-$GITHUB_RUN_ID"
           MINUTES_LEFT=45
-          for i in $(seq 1 45); do
-            # Send heartbeat every 5 minutes
-            if [ $((i % 5)) -eq 0 ] && [ -n "$COORDINATOR_URL" ]; then
+
+          # Every 30 seconds, we do a keep-alive loop (90 iterations over 45 minutes)
+          for i in $(seq 1 90); do
+            # 1. Direct P2P NAT Keep-alive (run STUN punch to refresh gateway mapping)
+            if [ "${{ github.event.inputs.tunnel }}" == "direct" ]; then
+              python3 scripts/stun_punch.py ${{ steps.creds.outputs.port }} > /dev/null 2>&1 || true
+            fi
+
+            # 2. Coordinator Heartbeat (every 5 minutes = 10 loop iterations)
+            if [ $((i % 10)) -eq 0 ] && [ -n "$COORDINATOR_URL" ]; then
               HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
                 -X POST "${COORDINATOR_URL}/heartbeat" \
                 -H "Content-Type: application/json" \
@@ -315,7 +356,6 @@ jobs:
                 -d "{\"id\": \"${HEARTBEAT_ID}\", \"expiresAt\": \"${EXPIRES_AT}\"}" 2>/dev/null || echo "000")
               if [ "$HTTP_CODE" = "404" ]; then
                 echo "⚠️ Proxy record lost, re-registering..."
-                # Rebuild registration JSON and re-post
                 CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
                 if [ "${{ github.event.inputs.tunnel }}" == "trycloudflare" ]; then
                   TYPE_PARAM="ws"
@@ -342,6 +382,12 @@ jobs:
                 echo "💓 Heartbeat: HTTP $HTTP_CODE"
               fi
             fi
-            echo "⏱️  Active for $i minutes... (${MINUTES_LEFT} min remaining)"
-            sleep 60
+
+            # Print status and sleep for 30s
+            if [ $((i % 2)) -eq 0 ]; then
+              MINS_PASSED=$((i / 2))
+              MINS_LEFT=$((45 - MINS_PASSED))
+              echo "⏱️  Active for ${MINS_PASSED} minutes... (${MINS_LEFT} min remaining)"
+            fi
+            sleep 30
           done
