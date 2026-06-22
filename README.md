@@ -1,8 +1,8 @@
-# 🌀 BPB Action Mesh
+# 🌀 Meshify
 
-> **Your own Tor. But with VLESS. And ephemeral nodes. Running on GitHub Actions.**
+> **Your own Tor. But with VLESS. And ephemeral nodes. Running on GitHub Actions. (other platforms support planned).**
 
-A decentralized mesh of ephemeral proxy nodes — powered by libp2p DHT discovery, VLESS/Hysteria2 transport, and the sheer audacity of using CI infrastructure as a proxy network. Pure science. No production use. Just vibes and distributed systems. 🧪
+A decentralized mesh of ephemeral proxy nodes — powered by libp2p DHT discovery and VLESS/Hysteria2 transport. Pure science. No production use. Just vibes and distributed systems. 🧪
 
 ---
 
