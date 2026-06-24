@@ -5,6 +5,12 @@
 **Authors:** Consillium (ChatGPT, Claude Sonnet 4.5, Gemini Pro, DeepSeek, Kimi 2.6, GLM 5.1)  
 **Nature:** Pure science experiment. No production use intended.
 
+> **V3 note:** This document is retained as historical architecture context.
+> For implementation, use `docs/SPEC-V3-ANIMAMESH-BACKEND.md`. The V3 spec
+> corrects the DHT discovery model, removes protocol secrets from public DHT/IPFS
+> records, and treats the Cloudflare Worker as a compatibility subscription
+> bridge rather than a DHT client.
+
 ---
 
 ## 1. What We Have (v1)

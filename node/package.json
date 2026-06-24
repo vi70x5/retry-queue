@@ -1,0 +1,39 @@
+{
+  "name": "animamesh-node",
+  "version": "1.0.0",
+  "description": "libp2p DHT mesh node for Animamesh — discovery, announce, and signed proxy record exchange",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "indexer": "tsx src/indexer.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "^15.0.0",
+    "@chainsafe/libp2p-yamux": "^6.0.0",
+    "@libp2p/bootstrap": "^10.0.0",
+    "@libp2p/crypto": "^4.0.0",
+    "@libp2p/identify": "^1.0.0",
+    "@libp2p/kad-dht": "^11.0.0",
+    "libp2p": "^1.0.0",
+    "@libp2p/peer-id": "^4.0.0",
+    "@libp2p/peer-id-factory": "^4.0.0",
+    "@multiformats/multiaddr": "^13.0.0",
+    "multiformats": "^13.0.0",
+    "@libp2p/tcp": "^9.0.0",
+    "it-length-prefixed": "^9.0.0",
+    "it-pipe": "^3.0.0",
+    "it-stream-types": "^2.0.0",
+    "p-defer": "^4.0.0",
+    "uint8arrays": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.5.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^3.2.0"
+  }
+}

@@ -12,7 +12,7 @@ on:
           - vless
           - hysteria2
       tunnel:
-        description: "Tunnel provider (Bore is raw TCP, TryCloudflare is HTTP/WS, Direct is P2P NAT punching)"
+        description: "Tunnel provider (Bore=raw TCP, TryCloudflare=HTTP/WS, Direct=P2P NAT, N2N=P2P VPN overlay)"
         required: true
         default: "bore"
         type: choice
@@ -20,12 +20,21 @@ on:
           - bore
           - trycloudflare
           - direct
+          - n2n
 
 env:
   COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
   AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
   NETWORK_ID: ${{ secrets.NETWORK_ID || 'bpb-default' }}
   BOOTSTRAP_PEERS: ${{ secrets.BOOTSTRAP_PEERS || '' }}
+  VLESS_UUID_SECRET: ${{ secrets.VLESS_UUID || '' }}
+  HY2_PASSWORD_SECRET: ${{ secrets.HY2_PASSWORD || '' }}
+  MESH_PUBLIC_KEY_ID: ${{ secrets.MESH_PUBLIC_KEY_ID || 'default' }}
+
+  N2N_COMMUNITY: ${{ secrets.N2N_COMMUNITY || '' }}
+  N2N_KEY: ${{ secrets.N2N_KEY || '' }}
+  N2N_SUPERNODE: ${{ secrets.N2N_SUPERNODE || 'supernode.ntop.org:7777' }}
+  N2N_VIRTUAL_IP: ${{ secrets.N2N_VIRTUAL_IP || '10.10.10.1' }}
 
 jobs:
   proxy:
@@ -74,9 +83,46 @@ jobs:
       - name: Generate credentials
         id: creds
         run: |
-          echo "uuid=$(uuidgen)" >> $GITHUB_OUTPUT
-          echo "password=$(openssl rand -hex 16)" >> $GITHUB_OUTPUT
+          if [ -n "${VLESS_UUID_SECRET:-}" ]; then
+            echo "::add-mask::$VLESS_UUID_SECRET"
+            echo "uuid=$VLESS_UUID_SECRET" >> $GITHUB_OUTPUT
+          else
+            echo "uuid=$(uuidgen)" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "${HY2_PASSWORD_SECRET:-}" ]; then
+            echo "::add-mask::$HY2_PASSWORD_SECRET"
+            echo "password=$HY2_PASSWORD_SECRET" >> $GITHUB_OUTPUT
+          else
+            echo "password=$(openssl rand -hex 16)" >> $GITHUB_OUTPUT
+          fi
           echo "port=$(shuf -i 20000-65000 -n 1)" >> $GITHUB_OUTPUT
+
+      # --- Step 2.5: Setup n2n P2P VPN overlay ---
+      - name: Setup n2n P2P Network
+        if: github.event.inputs.tunnel == 'n2n'
+        run: |
+          echo "🌐 Setting up n2n P2P VPN overlay..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq n2n
+
+          if [ -z "$N2N_COMMUNITY" ] || [ -z "$N2N_KEY" ]; then
+            echo "❌ N2N_COMMUNITY and N2N_KEY secrets are required for n2n tunnel"
+            echo "   Set them in: Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+          echo "🔐 Starting n2n edge (community=$N2N_COMMUNITY, supernode=$N2N_SUPERNODE, ip=$N2N_VIRTUAL_IP)"
+          sudo edge -c "$N2N_COMMUNITY" -k "$N2N_KEY" -a "$N2N_VIRTUAL_IP" -l "$N2N_SUPERNODE" -f > /tmp/n2n.log 2>&1 &
+
+          sleep 5
+          if ip addr show edge0 > /dev/null 2>&1; then
+            echo "✅ n2n connected! Virtual IP: $N2N_VIRTUAL_IP"
+            echo "TUNNEL_HOST=$N2N_VIRTUAL_IP" >> $GITHUB_ENV
+            echo "TUNNEL_PORT=${{ steps.creds.outputs.port }}" >> $GITHUB_ENV
+          else
+            echo "❌ n2n connection failed. Logs:"
+            cat /tmp/n2n.log
+            exit 1
+          fi
 
       # --- Step 3: Create Hysteria2 config ---
       - name: Setup Hysteria2
@@ -86,12 +132,20 @@ jobs:
           PORT: ${{ steps.creds.outputs.port }}
         run: |
           echo "🚀 Setting up Hysteria2..."
+
+          # Bind address: use n2n virtual IP if n2n tunnel, otherwise all interfaces
+          if [ "${{ github.event.inputs.tunnel }}" == "n2n" ]; then
+            LISTEN_ADDR="${{ env.N2N_VIRTUAL_IP }}"
+          else
+            LISTEN_ADDR="0.0.0.0"
+          fi
+
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
             -nodes -keyout /tmp/hy2-key.pem -out /tmp/hy2-cert.pem \
             -days 1 -subj "/CN=bpb-action"
 
           cat > /tmp/hysteria.yaml <<YAML
-          listen: :$PORT
+          listen: ${LISTEN_ADDR}:${PORT}
           tls:
             cert: /tmp/hy2-cert.pem
             key: /tmp/hy2-key.pem
@@ -122,12 +176,19 @@ jobs:
           UUID: ${{ steps.creds.outputs.uuid }}
           PORT: ${{ steps.creds.outputs.port }}
         run: |
-          if [ "${{ github.event.inputs.tunnel }}" == "trycloudflare" ]; then
-            echo "🚀 Setting up VLESS + WebSocket (for Cloudflare)..."
-            printf '{\n  "inbounds": [\n    {\n      "type": "vless",\n      "listen": "::",\n      "listen_port": %s,\n      "users": [{ "uuid": "%s" }],\n      "transport": {\n        "type": "ws",\n        "path": "/ws"\n      }\n    }\n  ],\n  "outbounds": [{ "type": "direct" }]\n}\n' "$PORT" "$UUID" > /tmp/sing-box.json
+          # Bind address: use n2n virtual IP if n2n tunnel, otherwise all interfaces
+          if [ "${{ github.event.inputs.tunnel }}" == "n2n" ]; then
+            LISTEN_ADDR="${{ env.N2N_VIRTUAL_IP }}"
           else
-            echo "🚀 Setting up VLESS over raw TCP (for Bore)..."
-            printf '{\n  "inbounds": [\n    {\n      "type": "vless",\n      "listen": "::",\n      "listen_port": %s,\n      "users": [{ "uuid": "%s" }]\n    }\n  ],\n  "outbounds": [{ "type": "direct" }]\n}\n' "$PORT" "$UUID" > /tmp/sing-box.json
+            LISTEN_ADDR="::"
+          fi
+
+          if [ "${{ github.event.inputs.tunnel }}" == "trycloudflare" ]; then
+            echo "🚀 Setting up VLESS + WebSocket (for Cloudflare) on $LISTEN_ADDR..."
+            printf '{\n  "inbounds": [\n    {\n      "type": "vless",\n      "listen": "%s",\n      "listen_port": %s,\n      "users": [{ "uuid": "%s" }],\n      "transport": {\n        "type": "ws",\n        "path": "/ws"\n      }\n    }\n  ],\n  "outbounds": [{ "type": "direct" }]\n}\n' "$LISTEN_ADDR" "$PORT" "$UUID" > /tmp/sing-box.json
+          else
+            echo "🚀 Setting up VLESS over raw TCP on $LISTEN_ADDR..."
+            printf '{\n  "inbounds": [\n    {\n      "type": "vless",\n      "listen": "%s",\n      "listen_port": %s,\n      "users": [{ "uuid": "%s" }]\n    }\n  ],\n  "outbounds": [{ "type": "direct" }]\n}\n' "$LISTEN_ADDR" "$PORT" "$UUID" > /tmp/sing-box.json
           fi
 
           nohup sing-box run -c /tmp/sing-box.json > /tmp/singbox.log 2>&1 &
@@ -244,6 +305,10 @@ jobs:
       # Build JSON payload as a temp file to avoid shell quoting nightmares.
       - name: Register proxy
         if: env.COORDINATOR_URL != ''
+        env:
+          MESH_SIGNING_PRIVATE_KEY: ${{ secrets.MESH_SIGNING_PRIVATE_KEY || '' }}
+          PROTOCOL: ${{ github.event.inputs.protocol }}
+          TUNNEL: ${{ github.event.inputs.tunnel }}
         run: |
           echo "📡 Registering with coordinator..."
           PROXY_ID="gha-$GITHUB_RUN_ID"
@@ -278,9 +343,101 @@ jobs:
           echo "📡 Registration response (HTTP $HTTP_CODE): $BODY"
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-            echo "⚠️ Registration failed! Dumping payload for debug:"
-            cat /tmp/register.json
+            echo "⚠️ Registration failed. Payload omitted because it can contain proxy secrets."
             exit 1
+          fi
+
+          if [ -n "${MESH_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::add-mask::$MESH_SIGNING_PRIVATE_KEY"
+            export PROXY_ID CREATED_AT TYPE_PARAM PATH_PARAM SECURITY_PARAM
+            node <<'NODE'
+          const crypto = require("crypto");
+          const fs = require("fs");
+
+          function canonical(value) {
+            if (Array.isArray(value)) return value.map(canonical);
+            if (value && typeof value === "object") {
+              return Object.keys(value).sort().reduce((out, key) => {
+                if (value[key] !== undefined) out[key] = canonical(value[key]);
+                return out;
+              }, {});
+            }
+            return value;
+          }
+
+          function keyFromSecret(secret) {
+            if (secret.includes("BEGIN")) return secret;
+            return Buffer.from(secret, "base64");
+          }
+
+          const protocol = process.env.PROTOCOL;
+          const tunnel = process.env.TUNNEL;
+          const host = process.env.TUNNEL_HOST;
+          const port = Number(process.env.TUNNEL_PORT);
+          const nodeId = crypto
+            .createHash("sha256")
+            .update(`${process.env.GITHUB_REPOSITORY}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}:${protocol}:${host}`)
+            .digest("hex");
+          const ingress =
+            tunnel === "trycloudflare" ? "cloudflared_quick" : tunnel === "n2n" ? "n2n" : tunnel === "bore" ? "bore" : "direct";
+          const transport = protocol === "vless" ? process.env.TYPE_PARAM : undefined;
+          const path = protocol === "vless" && process.env.PATH_PARAM ? process.env.PATH_PARAM : undefined;
+          const security = process.env.SECURITY_PARAM || (tunnel === "trycloudflare" ? "tls" : "none");
+          const record = {
+            schema: "animamesh.proxy.v1",
+            networkId: process.env.NETWORK_ID || "bpb-default",
+            nodeId,
+            run: {
+              repository: process.env.GITHUB_REPOSITORY || "",
+              runId: process.env.GITHUB_RUN_ID || "",
+              runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
+              workflow: process.env.GITHUB_WORKFLOW || "proxy.yml",
+              actor: process.env.GITHUB_ACTOR || "",
+            },
+            protocol,
+            ingress,
+            endpoint: {
+              host,
+              port,
+              sni: host,
+              transport,
+              path,
+              security,
+            },
+            capabilities: {
+              ipv4: true,
+              ipv6: false,
+              udp: protocol === "hysteria2",
+            },
+            lifecycle: {
+              createdAt: process.env.CREATED_AT,
+              expiresAt: process.env.EXPIRES_AT,
+              heartbeatAt: process.env.CREATED_AT,
+              ttlSeconds: 2700,
+            },
+            publicKeyId: process.env.MESH_PUBLIC_KEY_ID || "default",
+            signature: "",
+          };
+          const { signature: _signature, ...unsigned } = record;
+          record.signature = crypto
+            .sign(null, Buffer.from(JSON.stringify(canonical(unsigned))), keyFromSecret(process.env.MESH_SIGNING_PRIVATE_KEY || ""))
+            .toString("base64");
+          fs.writeFileSync("/tmp/mesh-register.json", JSON.stringify({ record }, null, 2));
+          fs.writeFileSync(
+            "/tmp/mesh-heartbeat.json",
+            JSON.stringify({ networkId: record.networkId, nodeId: record.nodeId, expiresAt: record.lifecycle.expiresAt }, null, 2),
+          );
+          NODE
+
+            MESH_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${COORDINATOR_URL}/mesh/register" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${AUTH_TOKEN}" \
+              -d @/tmp/mesh-register.json || true)
+            MESH_HTTP_CODE=$(echo "$MESH_RESPONSE" | tail -1)
+            MESH_BODY=$(echo "$MESH_RESPONSE" | head -n -1)
+            echo "📡 Mesh registration response (HTTP $MESH_HTTP_CODE): $MESH_BODY"
+          else
+            echo "ℹ️ MESH_SIGNING_PRIVATE_KEY is not set; skipping V3 mesh registration."
           fi
 
       # --- Step 7: Print subscription URL ---
@@ -294,12 +451,12 @@ jobs:
           echo "🔗 Tunnel: ${{ github.event.inputs.tunnel }}"
           echo "🔗 Public Host: $TUNNEL_HOST"
           echo "🔗 Public Port: $TUNNEL_PORT"
-          echo ""
-          if [ "${{ github.event.inputs.protocol }}" == "hysteria2" ]; then
-            echo "🔐 Password: ${{ steps.creds.outputs.password }}"
-          elif [ "${{ github.event.inputs.protocol }}" == "vless" ]; then
-            echo "🔐 UUID: ${{ steps.creds.outputs.uuid }}"
+          if [ "${{ github.event.inputs.tunnel }}" == "n2n" ]; then
+            echo "🧬 n2n Virtual IP: $N2N_VIRTUAL_IP"
+            echo "   Client must also join n2n network:"
+            echo "   sudo edge -c <N2N_COMMUNITY> -k <N2N_KEY> -a 10.10.10.2 -l $N2N_SUPERNODE"
           fi
+          echo "🔐 Proxy credentials are masked and not printed."
           echo ""
           if [ -n "$COORDINATOR_URL" ]; then
             echo "📋 Subscription URL: $COORDINATOR_URL/sub/all"
@@ -325,12 +482,17 @@ jobs:
           HY2_PASSWORD: ${{ steps.creds.outputs.password }}
           TTL_MINUTES: 45
           BOOTSTRAP_PEERS: ${{ secrets.BOOTSTRAP_PEERS || '' }}
+          TUNNEL_TYPE: ${{ github.event.inputs.tunnel }}
           TUNNEL_HOST: ${{ env.TUNNEL_HOST }}
           TUNNEL_PORT: ${{ env.TUNNEL_PORT }}
         run: |
           echo "🌐 Starting libp2p DHT mesh layer..."
-          cd node && npm install --silent 2>&1 && npx tsx src/index.ts &
-          echo "🧬 DHT mesh node launched in background (PID $!)"
+          if [ -d node ]; then
+            cd node && npm install --silent 2>&1 && npx tsx src/index.ts &
+            echo "🧬 DHT mesh node launched in background (PID $!)"
+          else
+            echo "ℹ️ node/ package is not present; skipping DHT mesh layer."
+          fi
 
       # --- Step 8: Keep alive with heartbeat ---
       - name: Keep runner alive with heartbeat
@@ -380,6 +542,23 @@ jobs:
               else
                 echo "💓 Heartbeat: HTTP $HTTP_CODE"
               fi
+
+              if [ -f /tmp/mesh-heartbeat.json ]; then
+                MESH_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                  -X POST "${COORDINATOR_URL}/mesh/heartbeat" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${AUTH_TOKEN}" \
+                  -d @/tmp/mesh-heartbeat.json 2>/dev/null || echo "000")
+                if [ "$MESH_HTTP_CODE" = "404" ] && [ -f /tmp/mesh-register.json ]; then
+                  echo "⚠️ Mesh record lost, re-registering..."
+                  MESH_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                    -X POST "${COORDINATOR_URL}/mesh/register" \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer ${AUTH_TOKEN}" \
+                    -d @/tmp/mesh-register.json 2>/dev/null || echo "000")
+                fi
+                echo "💓 Mesh heartbeat: HTTP $MESH_HTTP_CODE"
+              fi
             fi
 
             # Print status and sleep for 30s
@@ -390,3 +569,10 @@ jobs:
             fi
             sleep 30
           done
+
+          if [ -n "$COORDINATOR_URL" ] && [ -f /tmp/mesh-heartbeat.json ]; then
+            curl -s -X POST "${COORDINATOR_URL}/mesh/deregister" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${AUTH_TOKEN}" \
+              -d @/tmp/mesh-heartbeat.json >/dev/null 2>&1 || true
+          fi

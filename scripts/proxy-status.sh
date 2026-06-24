@@ -76,6 +76,23 @@ except:
     echo "  No active proxies registered."
   fi
 
+  MESH_STATUS=$(curl -s --max-time 5 "${COORDINATOR_URL}/mesh/status" 2>/dev/null || echo "")
+  if [ -n "$MESH_STATUS" ] && echo "$MESH_STATUS" | grep -qE '"activeNodes"'; then
+    echo ""
+    echo "🧬 Mesh status:"
+    echo "$MESH_STATUS" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    protocols = data.get('protocols', {})
+    print(f\"  Active nodes: {data.get('activeNodes', 0)}  vless: {protocols.get('vless', 0)}  hysteria2: {protocols.get('hysteria2', 0)}\")
+    for n in data.get('nodes', []):
+        print(f\"  🟢 {n.get('protocol','?')} via {n.get('ingress','?')} → {n.get('host','?')}  heartbeat: {n.get('heartbeatAt','?')}\")
+except Exception:
+    print('  (parse error)')
+" 2>/dev/null || echo "  $MESH_STATUS"
+  fi
+
   # Subscription content
   SUB=$(curl -s --max-time 5 "${COORDINATOR_URL}/sub/all" 2>/dev/null || echo "")
   if [ -n "$SUB" ] && echo "$SUB" | grep -qE '^(vless|hysteria2)://'; then

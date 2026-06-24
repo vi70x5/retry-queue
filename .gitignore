@@ -1,5 +1,4 @@
 /worker/.wrangler/
 .wrangler/
 node_modules
-node
 coverage/

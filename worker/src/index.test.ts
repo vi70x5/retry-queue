@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	canonicalJSONStringify,
 	checkAuth,
 	corsHeaders,
 	type Env,
@@ -13,7 +14,9 @@ import {
 	kvPut,
 	memoryStore,
 	type ProxyConfig,
+	type PublicProxyRecord,
 	ttlToSeconds,
+	verifyPublicRecord,
 	default as worker,
 } from "./index";
 
@@ -54,6 +57,80 @@ const bearerHeader = (token: string) => ({
 const jsonResponse = async (res: Response) => {
 	const text = await res.text();
 	return JSON.parse(text);
+};
+
+const toBase64 = (bytes: ArrayBuffer | Uint8Array) =>
+	Buffer.from(
+		bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
+	).toString("base64");
+
+const unsignedPayload = (record: PublicProxyRecord) => {
+	const { signature: _signature, ...unsigned } = record;
+	return canonicalJSONStringify(unsigned);
+};
+
+const generateMeshKeyPair = async () => {
+	const keyPair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+		"sign",
+		"verify",
+	])) as CryptoKeyPair;
+	const publicKey = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+	return { keyPair, publicKeyBase64: toBase64(publicKey) };
+};
+
+const makeUnsignedRecord = (
+	overrides: Partial<PublicProxyRecord> = {},
+): PublicProxyRecord => {
+	const now = new Date();
+	const expiresAt = new Date(now.getTime() + 30 * 60 * 1000).toISOString();
+	return {
+		schema: "animamesh.proxy.v1",
+		networkId: "animamesh-test",
+		nodeId: "node-test-1",
+		run: {
+			repository: "owner/repo",
+			runId: "123",
+			runAttempt: "1",
+			workflow: "proxy.yml",
+			actor: "tester",
+		},
+		protocol: "vless",
+		ingress: "cloudflared_quick",
+		endpoint: {
+			host: "abc.trycloudflare.com",
+			port: 443,
+			sni: "abc.trycloudflare.com",
+			transport: "ws",
+			path: "/ws",
+			security: "tls",
+		},
+		capabilities: {
+			ipv4: true,
+			ipv6: false,
+			udp: false,
+		},
+		lifecycle: {
+			createdAt: now.toISOString(),
+			expiresAt,
+			heartbeatAt: now.toISOString(),
+			ttlSeconds: 1800,
+		},
+		publicKeyId: "kid-test",
+		signature: "",
+		...overrides,
+	};
+};
+
+const signRecord = async (
+	record: PublicProxyRecord,
+	keyPair: CryptoKeyPair,
+): Promise<PublicProxyRecord> => {
+	const signature = await crypto.subtle.sign(
+		{ name: "Ed25519" },
+		keyPair.privateKey,
+		new TextEncoder().encode(unsignedPayload(record)),
+	);
+	return { ...record, signature: toBase64(signature) };
 };
 
 // ---------------------------------------------------------------------------
@@ -673,6 +750,259 @@ describe("fetch router", () => {
 		});
 	});
 
+	describe("V3 mesh routes", () => {
+		const meshEnv = async () => {
+			const { keyPair, publicKeyBase64 } = await generateMeshKeyPair();
+			const env = makeEnv({
+				AUTH_TOKEN: "test-token",
+				NETWORK_ID: "animamesh-test",
+				VLESS_UUID: "env-vless-uuid",
+				HY2_PASSWORD: "env-hy2-password",
+				MESH_PUBLIC_KEYS: JSON.stringify({ "kid-test": publicKeyBase64 }),
+				MESH_PUBLIC_KEY_ID: "kid-test",
+				BOOTSTRAP_PEERS: "/ip4/127.0.0.1/tcp/4001/p2p/test",
+			});
+			return { env, keyPair };
+		};
+
+		// Test 1: Rejects unsigned /mesh/register
+		it("rejects unsigned /mesh/register", async () => {
+			const { env } = await meshEnv();
+			const res = await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record: makeUnsignedRecord() }),
+				}),
+				env,
+			);
+			expect(res.status).toBe(400);
+			const body = await jsonResponse(res);
+			expect(body.error).toBe("Missing signature");
+		});
+
+		// Test 2: Rejects expired record
+		it("rejects expired record", async () => {
+			const { env, keyPair } = await meshEnv();
+			const record = await signRecord(
+				makeUnsignedRecord({
+					lifecycle: {
+						createdAt: "2026-01-01T00:00:00.000Z",
+						expiresAt: "2026-01-01T00:10:00.000Z",
+						heartbeatAt: "2026-01-01T00:00:00.000Z",
+						ttlSeconds: 600,
+					},
+				}),
+				keyPair,
+			);
+			const res = await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record }),
+				}),
+				env,
+			);
+			expect(res.status).toBe(400);
+			const body = await jsonResponse(res);
+			expect(body.error).toBe("Record expired");
+		});
+
+		// Test 3: Rejects wrong networkId
+		it("rejects wrong networkId", async () => {
+			const { env, keyPair } = await meshEnv();
+			const record = await signRecord(
+				makeUnsignedRecord({ networkId: "other-network" }),
+				keyPair,
+			);
+			const res = await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record }),
+				}),
+				env,
+			);
+			expect(res.status).toBe(400);
+			const body = await jsonResponse(res);
+			expect(body.error).toBe("Wrong networkId");
+		});
+
+		// Test 4: Rejects invalid endpoint host (private IP with non-n2n ingress)
+		it("rejects private endpoint host with non-n2n ingress", async () => {
+			const { env, keyPair } = await meshEnv();
+			const record = await signRecord(
+				makeUnsignedRecord({
+					endpoint: {
+						host: "10.0.0.1",
+						port: 443,
+						sni: "10.0.0.1",
+						security: "tls",
+					},
+				}),
+				keyPair,
+			);
+			const res = await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record }),
+				}),
+				env,
+			);
+			expect(res.status).toBe(400);
+			const body = await jsonResponse(res);
+			expect(body.error).toBe("Invalid endpoint host");
+		});
+
+		// Test 5: Accepts n2n ingress with private IP
+		it("accepts n2n ingress with private IP", async () => {
+			const { env, keyPair } = await meshEnv();
+			const record = await signRecord(
+				makeUnsignedRecord({
+					ingress: "n2n",
+					endpoint: {
+						host: "10.10.10.1",
+						port: 443,
+						sni: "mesh.local",
+						security: "none",
+					},
+				}),
+				keyPair,
+			);
+			const res = await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record }),
+				}),
+				env,
+			);
+			expect(res.status).toBe(200);
+			const body = await jsonResponse(res);
+			expect(body.success).toBe(true);
+		});
+
+		// Test 6: Accepts valid signed record
+		it("accepts valid signed record", async () => {
+			const { env, keyPair } = await meshEnv();
+			const record = await signRecord(makeUnsignedRecord(), keyPair);
+			const res = await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record }),
+				}),
+				env,
+			);
+			expect(res.status).toBe(200);
+			const body = await jsonResponse(res);
+			expect(body.success).toBe(true);
+			expect(body.message).toBe("Mesh record registered");
+			expect(body.subscriptionUrl).toContain("/sub/all");
+			expect(body.ttlSeconds).toBeGreaterThan(0);
+		});
+
+		// Test 7: /sub/all renders env-derived VLESS and Hy2 links
+		it("/sub/all renders env-derived VLESS and Hy2 links", async () => {
+			const { env, keyPair } = await meshEnv();
+			const vless = await signRecord(makeUnsignedRecord(), keyPair);
+			const hy2 = await signRecord(
+				makeUnsignedRecord({
+					nodeId: "node-hy2-1",
+					protocol: "hysteria2",
+					endpoint: {
+						host: "hy2.trycloudflare.com",
+						port: 443,
+						sni: "hy2.trycloudflare.com",
+						security: "tls",
+					},
+				}),
+				keyPair,
+			);
+			for (const record of [vless, hy2]) {
+				const res = await worker.fetch(
+					makeRequest("/mesh/register", {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							...bearerHeader("test-token"),
+						},
+						body: JSON.stringify({ record }),
+					}),
+					env,
+				);
+				expect(res.status).toBe(200);
+			}
+			// Records have no uuid/password - Worker fills from env
+			const sub = await worker.fetch(makeRequest("/sub/all"), env);
+			const text = await sub.text();
+			expect(text).toContain(
+				"vless://env-vless-uuid@abc.trycloudflare.com:443",
+			);
+			expect(text).toContain(
+				"hysteria2://env-hy2-password@hy2.trycloudflare.com:443",
+			);
+		});
+
+		// Test 8: /proxies and /mesh/status do not expose secrets
+		it("/proxies and /mesh/status do not expose secrets", async () => {
+			const { env, keyPair } = await meshEnv();
+			const record = await signRecord(makeUnsignedRecord(), keyPair);
+			await worker.fetch(
+				makeRequest("/mesh/register", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						...bearerHeader("test-token"),
+					},
+					body: JSON.stringify({ record }),
+				}),
+				env,
+			);
+			const proxies = await (
+				await worker.fetch(makeRequest("/proxies"), env)
+			).text();
+			const status = await (
+				await worker.fetch(makeRequest("/mesh/status"), env)
+			).text();
+			// No secrets should leak into public endpoints
+			expect(proxies).not.toContain("env-vless-uuid");
+			expect(proxies).not.toContain("env-hy2-password");
+			expect(proxies).not.toContain("test-token");
+			expect(status).not.toContain("env-vless-uuid");
+			expect(status).not.toContain("env-hy2-password");
+			expect(status).not.toContain("test-token");
+			expect(JSON.parse(status).activeNodes).toBe(1);
+		});
+
+		it("returns bootstrap peers", async () => {
+			const { env } = await meshEnv();
+			const res = await worker.fetch(makeRequest("/bootstrap/peers"), env);
+			expect(res.status).toBe(200);
+			const body = await jsonResponse(res);
+			expect(body.peers).toEqual(["/ip4/127.0.0.1/tcp/4001/p2p/test"]);
+		});
+	});
+
 	// -- GET /sub/all --
 
 	describe("GET /sub/all", () => {
@@ -855,7 +1185,7 @@ describe("fetch router", () => {
 			expect(res.status).toBe(200);
 			const body = await jsonResponse(res);
 			expect(body.name).toBe("BPB Action Coordinator");
-			expect(body.version).toBe("1.1.0");
+			expect(body.version).toBe("1.2.0");
 			expect(body.endpoints).toBeDefined();
 		});
 	});
@@ -1204,10 +1534,21 @@ describe("API index endpoint", () => {
 		expect(res.status).toBe(200);
 		const body = await jsonResponse(res);
 		expect(body.name).toBe("BPB Action Coordinator");
-		expect(body.version).toBe("1.1.0");
+		expect(body.version).toBe("1.2.0");
 		expect(body.endpoints).toEqual({
 			"POST /register": "Register a new proxy (auth required)",
 			"POST /heartbeat": "Refresh proxy TTL (auth required)",
+			"POST /mesh/register":
+				"Register signed public mesh metadata (auth required)",
+			"POST /mesh/heartbeat":
+				"Refresh signed mesh metadata TTL (auth required)",
+			"POST /mesh/deregister": "Delete mesh metadata (auth required)",
+			"GET /mesh/status": "Get mesh health summary",
+			"GET /mesh/snapshot": "Get public mesh snapshot",
+			"GET /bootstrap/peers": "Get bootstrap multiaddrs",
+			"GET /mesh/n2n-config":
+				"Get public n2n join info (community + supernode)",
+			"POST /mesh/n2n-join": "Get full n2n config with key (auth required)",
 			"GET /sub/all": "Get subscription for all proxies",
 			"GET /sub/{id}": "Get subscription for specific proxy",
 			"GET /proxies": "List all active proxies",
@@ -1360,5 +1701,162 @@ describe("Dev mode (no AUTH_TOKEN)", () => {
 		expect(res.status).toBe(200);
 		const body = await jsonResponse(res);
 		expect(body.success).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 13. verifyPublicRecord pure function tests
+// ---------------------------------------------------------------------------
+
+describe("verifyPublicRecord", () => {
+	let keyPair: CryptoKeyPair;
+	let publicKeyBase64: string;
+	let env: Env;
+
+	beforeEach(async () => {
+		memoryStore.clear();
+		const generated = await generateMeshKeyPair();
+		keyPair = generated.keyPair;
+		publicKeyBase64 = generated.publicKeyBase64;
+		env = makeEnv({
+			AUTH_TOKEN: "test-token",
+			NETWORK_ID: "animamesh-test",
+			MESH_PUBLIC_KEYS: JSON.stringify({ "kid-test": publicKeyBase64 }),
+		});
+	});
+
+	it("returns ok for a valid signed record", async () => {
+		const record = await signRecord(makeUnsignedRecord(), keyPair);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(true);
+	});
+
+	it("rejects missing record", async () => {
+		const result = await verifyPublicRecord(
+			null as unknown as PublicProxyRecord,
+			env,
+		);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Missing record");
+	});
+
+	it("rejects wrong schema", async () => {
+		const record = makeUnsignedRecord({
+			schema: "wrong.v1",
+		} as PublicProxyRecord);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Unsupported schema");
+	});
+
+	it("rejects wrong networkId", async () => {
+		const record = await signRecord(
+			makeUnsignedRecord({ networkId: "other-network" }),
+			keyPair,
+		);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Wrong networkId");
+	});
+
+	it("accepts n2n ingress with private IP host", async () => {
+		const record = await signRecord(
+			makeUnsignedRecord({
+				ingress: "n2n",
+				endpoint: {
+					host: "10.10.10.1",
+					port: 443,
+					sni: "mesh.local",
+					security: "none",
+				},
+			}),
+			keyPair,
+		);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(true);
+	});
+
+	it("rejects private IP with non-n2n ingress", async () => {
+		const record = await signRecord(
+			makeUnsignedRecord({
+				endpoint: {
+					host: "10.0.0.1",
+					port: 443,
+					sni: "10.0.0.1",
+					security: "tls",
+				},
+			}),
+			keyPair,
+		);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Invalid endpoint host");
+	});
+
+	it("rejects expired records", async () => {
+		const record = await signRecord(
+			makeUnsignedRecord({
+				lifecycle: {
+					createdAt: "2026-01-01T00:00:00.000Z",
+					expiresAt: "2026-01-01T00:10:00.000Z",
+					heartbeatAt: "2026-01-01T00:00:00.000Z",
+					ttlSeconds: 600,
+				},
+			}),
+			keyPair,
+		);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Record expired");
+	});
+
+	it("rejects records without signature", async () => {
+		const record = makeUnsignedRecord(); // signature: ""
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Missing signature");
+	});
+
+	it("rejects bad signature", async () => {
+		const record = { ...makeUnsignedRecord(), signature: "AAAA" };
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Bad signature");
+	});
+
+	it("rejects unknown publicKeyId", async () => {
+		const record = await signRecord(
+			{ ...makeUnsignedRecord(), publicKeyId: "unknown-key" },
+			keyPair,
+		);
+		const result = await verifyPublicRecord(record, env);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toBe("Unknown publicKeyId");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 14. canonicalJSONStringify
+// ---------------------------------------------------------------------------
+
+describe("canonicalJSONStringify", () => {
+	it("sorts object keys", () => {
+		const result = canonicalJSONStringify({ z: 1, a: 2, m: 3 });
+		expect(result).toBe('{"a":2,"m":3,"z":1}');
+	});
+
+	it("sorts nested object keys recursively", () => {
+		const result = canonicalJSONStringify({ outer: { z: 1, a: 2 } });
+		expect(result).toBe('{"outer":{"a":2,"z":1}}');
+	});
+
+	it("handles arrays without reordering", () => {
+		const result = canonicalJSONStringify({ items: [3, 1, 2] });
+		expect(result).toBe('{"items":[3,1,2]}');
+	});
+
+	it("strips undefined values", () => {
+		const result = canonicalJSONStringify({ a: 1, b: undefined, c: 3 });
+		expect(result).toBe('{"a":1,"c":3}');
 	});
 });
