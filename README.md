@@ -1,484 +1,355 @@
-# 🌀 Meshify
+# 🌀 Animamesh
 
-> **Your own Tor. But with VLESS. And ephemeral nodes. Running on GitHub Actions. (other platforms support planned).**
+> **Direct P2P proxy from your PC to GitHub Actions runners. No CDN. No middleman. Pure n2n.**
 
-A decentralized mesh of ephemeral proxy nodes — powered by libp2p DHT discovery and VLESS/Hysteria2 transport. Pure science. No production use. Just vibes and distributed systems. 🧪
+Ephemeral proxy nodes running inside GitHub Actions, connected to your machine via a Layer 2 P2P VPN overlay. The coordinator is just a rendezvous — once you're on the n2n mesh, your traffic flows **directly** between peers. No Cloudflare. No ngrok. No VPS required.
+
+Pure science experiment. Not a production service. 🧪
 
 ---
 
 ## 🧬 The Big Idea
 
-GitHub Actions runners become ephemeral proxy nodes. They discover each other via a Kademlia DHT (like BitTorrent finds peers). Actual proxy traffic flows directly over VLESS/Hysteria2 — the DHT is **only** for discovery, never in the data path. Nodes live 15-60 minutes (random TTL), die, and trigger fresh runners to replace them. The mesh self-heals.
+GitHub Actions runners have **unrestricted outbound internet** but block all inbound traffic. You can't connect *to* a runner. But the runner can dial *out* to a supernode — and so can you.
 
-**The BitTorrent Sync analogy** (because analogies are how we think):
+**n2n** turns this asymmetry into a direct tunnel:
 
 ```
-Resilio Sync (formerly BitTorrent Sync):
-  ┌──────────────────────┐        ┌──────────────────────┐
-  │  DHT / bootstrap      │  find  │  Direct peer-to-peer │
-  │  servers               │──►──► │  file transfer        │
-  │  (discovery only)      │  peers │  (the actual data)   │
-  └──────────────────────┘        └──────────────────────┘
-
-BPB Mesh v2:
-  ┌──────────────────────┐        ┌──────────────────────┐
-  │  libp2p Kademlia DHT │  find  │  Direct VLESS/Hy2     │
-  │  (discovery only)    │──►──► │  proxy connections    │
-  │  Coordinator = tracker│  nodes │  (the actual traffic) │
-  └──────────────────────┘        └──────────────────────┘
+  Your PC                        Supernode                     GHA Runner
+  ───────                       ─────────                     ─────────
+  edge -c net -k key -a 10.0.0.2 ──► supernode.ntop.org:7777 ◄── edge -c net -k key -a 10.0.0.1
+       │                              (forwards peer coords)        │
+       ◄─────────── direct UDP hole-punched P2P link ──────────────►
+       │                                                              │
+  Hysteria2 client                                             Hysteria2 server
+  (SOCKS5 on 127.0.0.1:1080)                                (bound to 10.0.0.1:PORT)
 ```
 
-You don't download files through the BitTorrent DHT. You don't proxy traffic through the BPB DHT. Same principle. DHT finds the nodes. VLESS carries the bytes.
+The supernode is **never in the data path** — it just introduces peers so they can punch through NAT. Once both edges connect, they talk directly. Your proxy traffic never touches any relay, CDN, or coordinator.
 
 ---
 
-## 😤 Why v2? (The v1 Problems)
-
-v1 worked. Sort of. In the way that a single bridge works until it collapses.
+## 🏗️ Architecture
 
 ```
-v1 — Centralized. Fragile. Lonely.
-
-  Client ──► CF Worker (coordinator) ──► single GHA runner ──► trycloudflare
-                    │
-                    │ if this dies...
-                    │
-                    ▼
-              ☠️ EVERYTHING DIES ☠️
+                          ┌──────────────────────┐
+                          │  Cloudflare Worker    │
+                          │  (coordinator)        │
+                          │                       │
+                          │  Public endpoints:    │
+                          │    GET /mesh/n2n-config  → {community, supernode}
+                          │    POST /mesh/n2n-join   → {community, key, supernode}
+                          │    GET /sub/all          → proxy subscription
+                          │    GET /health           → status
+                          └──────┬───────────────┘
+                                 │ HTTPS (control plane only)
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+           ┌──────────────┐         ┌──────────────────┐
+           │  GHA Runner  │         │  Your Linux PC   │
+           │  10.10.10.1  │◄───────►│  10.10.10.X      │
+           │  Hysteria2   │  n2n   │  Hysteria2 client │
+           │  (server)    │  P2P   │  (SOCKS5 proxy)   │
+           └──────────────┘         └──────────────────┘
+                    ▲                     ▲
+                    └───── Direct ────────┘
+                      (no middleman!)
 ```
 
-**What was wrong:**
+### The two-layer trust model
 
-| Problem | Why It Hurt |
-|---|---|
-| Coordinator = SPOF | If the CF Worker went down, all clients lost all connectivity |
-| 1 runner at a time | No redundancy. One node. One life. One chance. |
-| Manual respawn | Push to main or manually trigger. No self-healing. |
-| CF Worker KV as sole discovery | Single database. Single point of truth. Single point of failure. |
+| Layer | What it does | Credential | Who distributes it |
+|---|---|---|---|
+| **n2n overlay** | VPN mesh — L2 adjacency, direct P2P reachability | Community name + encryption key (`-c` / `-k`) | Worker (`/mesh/n2n-join`, auth-gated) |
+| **Hysteria2 proxy** | Application-level SOCKS5 tunnel, QUIC+TLS encrypted | Random per-run password | Worker (`/sub/all`, inside the subscription URL) |
 
-v2 asks: *what if there were no center?*
+**Why two passwords?** The n2n key gets you on the network — like WiFi WPA2. The Hysteria2 password lets you use the proxy — like your router admin password. Even if someone else joins the same n2n community, they can't use your proxy without the per-run Hysteria2 password. Two factors: network access + application auth.
+
+See [SPEC-V3 §6 Data Models](docs/SPEC-V3-ANIMAMESH-BACKEND.md) for the full `PublicProxyRecord` and `SignedSnapshot` schemas, and [SPEC-V3 §10 Subscription Generation](docs/SPEC-V3-ANIMAMESH-BACKEND.md) for how credentials flow into subscription links.
+
+### The Worker is NOT in the data path
+
+The Cloudflare Worker serves two roles, both **control plane only**:
+
+1. **n2n coordinator** — distributes community name, encryption key, and supernode address so you can join the mesh
+2. **subscription server** — lists active proxy endpoints (host, port, protocol credentials) so your client knows where to connect
+
+Neither role touches proxy traffic. The Worker never sees a single byte of your browsing.
 
 ---
 
-## 🕸️ The v2 Architecture
+## 🚀 Quick Start
 
-```
-                    ┌──────────────────────────────────────┐
-                    │          DHT (Kademlia)               │
-                    │                                        │
-                    │  Node A ◄──► Node B ◄──► Node C       │
-                    │  TTL: 37m      TTL: 52m      TTL: 23m  │
-                    │                                        │
-                    │  Keys: /bpb/v2/{net-id}/vless/{peer}   │
-                    │  Values: { host, port, uuid, sni }     │
-                    └───────┬────────────┬──────────────┬────┘
-                            │            │              │
-                            ▼            ▼              ▼
-                       ┌─────────┐ ┌─────────┐  ┌─────────┐
-                       │ VLESS   │ │ VLESS   │  │ Hy2     │
-                       │ server  │ │ server  │  │ server  │
-                       │ CF tun  │ │ CF tun  │  │ CF tun  │
-                       └────┬────┘ └────┬────┘  └────┬────┘
-                            │           │            │
-                  client connects DIRECTLY via VLESS/Hy2
-                  (no libp2p in the data path. ever.)
+### What you need
 
-         ┌─────────────────────────────────────────────┐
-         │         Coordinator (optional tracker)       │
-         │  /bootstrap/peers  /sub/all  /mesh/status     │
-         │  Helpful but NOT required for the mesh to run │
-         └─────────────────────────────────────────────┘
-```
+- A GitHub account (free tier works)
+- A Linux machine (Debian/Ubuntu, Arch, or Fedora)
+- `sudo` on your machine (n2n creates a TUN interface)
+- 5 minutes
 
-**The three laws of v2:**
+### Step 1: Fork & add secrets
 
-1. **libp2p for discovery ONLY.** Data path = VLESS/Hy2 directly. Period.
-2. **Coordinator is optional.** It's a BitTorrent tracker — nice to have, not required.
-3. **Ephemeral by design.** Nodes live minutes, not days. No persistent state. Identity is per-lifecycle.
+1. Fork this repository
+2. Go to **Settings → Secrets and variables → Actions**
+3. Add these secrets:
 
----
-
-## 🔄 The Lifecycle of a Node
-
-Every node follows the same beautiful, tragic arc:
-
-```
-  SPAWN ──────► BOOTSTRAP ──────► ANNOUNCE ──────► SERVE ──────► PRE_DEATH ──────► DEREGISTER ──────► DIE
-  (GHA           (join DHT,       (publish        (proxy        (TTL -5 min,       (tombstone in       (runner
-  starts)        find peers)      config to       traffic       trigger respawn)    DHT, clean up)      exits)
-                                 DHT)            flows)
-                                                                      │
-                                                                      ▼
-                                                              RESPAWN
-                                                              (git push /
-                                                              workflow_dispatch
-                                                              → new GHA run)
-```
-
-Each node draws a **random TTL from uniform(15, 60) minutes**. This jitter is the secret sauce — it prevents synchronized herd death. At any moment, some nodes are young, some are middle-aged, some are about to die. The mesh is always alive.
-
-5 minutes before TTL expires, the node:
-1. Triggers a respawn (GitHub API or git push)
-2. Waits up to 2 minutes for the new node to bootstrap
-3. Publishes a tombstone to the DHT
-4. Dies gracefully
-
----
-
-## 🎯 How Clients Connect
-
-```
-Mode 1: DHT-Native (no coordinator needed)
-─────────────────────────────────────────
-  Client (Hiddify) ──► DHT Resolver ──► DHT ──► proxy configs
-                                                    │
-  Client ──► VLESS/Hy2 connection directly to node ◄┘
-  (libp2p is NOT in the data path)
-
-Mode 2: Coordinator-Backed (backward compatible with v1)
-──────────────────────────────
-  Client ──► GET /sub/all on coordinator ──► coordinator queries DHT + its own KV
-                                                    │
-  Client ──► VLESS/Hy2 connection directly to node ◄┘
-```
-
-**Coordinator degradation — the mesh survives without it:**
-
-| Coordinator | DHT | Result |
+| Secret | What it is | Example |
 |---|---|---|
-| ✅ Online | ✅ Active | Best of both — coordinator caches DHT results |
-| ✅ Online | ❌ No peers | Coordinator falls back to its own KV (legacy v1 mode) |
-| ❌ Offline | ✅ Active | Client resolves DHT directly — zero impact |
-| ❌ Offline | ❌ No peers | Dead mesh. Needs manual intervention. |
+| `COORDINATOR_URL` | Your Worker URL (after deploying in Step 2) | `https://animamesh.you.workers.dev` |
+| `AUTH_TOKEN` | Shared secret for Worker auth | `my-secret-token-123` |
+| `N2N_COMMUNITY` | n2n community name — pick something unique | `animamesh-net-2026` |
+| `N2N_KEY` | n2n encryption key — strong password | `MyStr0ngP2PEncrypt10n!` |
+| `NETWORK_ID` | Mesh network identifier | `my-mesh` |
+
+### Step 2: Deploy the coordinator
+
+```bash
+git clone https://github.com/YOURUSERNAME/animamesh.git
+cd animamesh/backend
+npm install
+
+# Deploy the Cloudflare Worker
+cd worker
+npm install
+npx wrangler login
+npx wrangler deploy
+# → Save the URL (e.g. https://animamesh.you.workers.dev)
+
+# Set n2n secrets on the Worker
+npx wrangler secret put N2N_COMMUNITY   # enter your community name
+npx wrangler secret put N2N_KEY          # enter your encryption key
+```
+
+### Step 3: Launch a proxy runner
+
+```bash
+# Trigger a GitHub Actions runner with n2n tunnel + Hysteria2
+./scripts/proxy-up.sh --protocol hysteria2
+
+# Or manually: Actions → BPB Action Proxy → Run workflow
+#   Protocol: hysteria2
+#   Tunnel:   n2n
+```
+
+The runner will:
+1. Start n2n edge → join the overlay VPN as `10.10.10.1`
+2. Start Hysteria2 server bound to `10.10.10.1:PORT`
+3. Register itself with the Worker coordinator
+4. Heartbeat every 5 minutes until the 45-minute timeout
+
+### Step 4: Connect from your PC
+
+```bash
+# One command — that's it
+./scripts/animamesh-connect.sh \
+  --coordinator https://animamesh.you.workers.dev \
+  --auth-token my-secret-token-123
+```
+
+This will:
+1. Install `n2n` if missing
+2. Fetch n2n credentials from the Worker (auth-gated)
+3. Join the n2n P2P overlay as `10.10.10.X`
+4. Discover active Hysteria2 proxies from the Worker subscription
+5. Start Hysteria2 SOCKS5 tunnel on `127.0.0.1:1080`
+
+### Step 5: Use the proxy
+
+```bash
+curl --socks5 127.0.0.1:1080 https://ifconfig.me
+
+# Or set environment variables
+export http_proxy=socks5://127.0.0.1:1080
+export https_proxy=socks5://127.0.0.1:1080
+```
+
+Press **Ctrl+C** to gracefully disconnect — stops Hysteria2 and n2n edge.
 
 ---
 
-## ⚡ Concurrency: Not Just One Node Anymore
+## 🔌 Connection Modes
 
-v1 ran one lonely runner at a time. v2 spawns a **matrix** of 2-5 concurrent nodes:
+Animamesh supports multiple tunnel types, from purely direct to CDN-backed:
 
-```yaml
-strategy:
-  matrix:
-    node-index: [0, 1, 2]  # 3 initial nodes
-  fail-fast: false
-```
+| Tunnel | Data path | NAT traversal | Latency | Setup |
+|---|---|---|---|---|
+| **n2n** 🌟 | Direct P2P (UDP hole-punched) | Supernode-assisted | Low | Set 2 secrets |
+| **bore** | bore.pub relay | Public relay | Medium | Just works |
+| **trycloudflare** | Cloudflare CDN | CF tunnel | Higher | Just works |
+| **direct** | Raw STUN punch | STUN server | Lowest | Fragile, often blocked |
 
-Each matrix slot gets a slightly offset TTL base. When one node dies, it triggers exactly one replacement. Staggered TTLs guarantee at least 1-2 nodes are always alive.
+**n2n is the primary mode** — direct, encrypted, no third-party in the data path. The other modes are fallbacks for when supernodes are unreachable or you need CDN compatibility (e.g. for Hiddify/v2ray clients).
 
-```
-  Timeline (minutes):  0    10    20    30    40    50    60
-  ─────────────────────────────────────────────────────────
-  Node A (TTL=37):     ██████████████████████████████░░░ RIP
-  Node B (TTL=52):     ████████████████████████████████████████████░░░░░ RIP
-  Node C (TTL=23):     ███████████████████████░░ RIP
-  Node D (spawned):                     ████████████████████████████████░ RIP
-  Node E (spawned):                                        █████████████ ...
-  ─────────────────────────────────────────────────────────
-  Active nodes:         3     3     3     3     3     2     2
-```
+### When to use what
 
----
-
-## 🛡️ Threat Model (v1 vs v2)
-
-| Threat | v1 | v2 |
-|---|---|---|
-| Coordinator DDoS | ☠️ Fatal | ✅ DHT resolves locally, coordinator optional |
-| Coordinator compromised | ⚠️ MITM risk | ✅ DHT records signed (Ed25519), clients verify |
-| Sybil attack (fake nodes) | N/A (centralized) | ✅ Network-ID = shared secret, peer verification |
-| Single runner dies | ☠️ Total outage | ✅ Multiple concurrent nodes, DHT failover |
-| Ghost nodes (dead but registered) | Common (KV TTL 24h) | ✅ Short re-announce (5min), tombstones, client verification |
-| Node impersonation | N/A | ✅ DHT provider records bound to PeerId |
-
----
-
-## 🧰 Technology Stack
-
-| Component | Technology | Why |
-|---|---|---|
-| DHT discovery | `@libp2p/kad-dht` | Standard Kademlia, npm package, runs in GHA node |
-| Peer identity | `@libp2p/peer-id` (Ed25519) | Crypto identity, DHT record signing |
-| NAT traversal | cloudflared (existing) | No libp2p relay needed — CF tunnel solves NAT |
-| Proxy traffic | sing-box (VLESS) + Hysteria2 | Unchanged from v1 — proven, efficient |
-| Coordinator | Cloudflare Worker | Now with DHT bridge + optional tracker role |
-| Respawn trigger | GitHub REST API | `POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches` |
-
-**What runs inside each GHA runner:**
-
-```
-┌─────────────────────────────────────────┐
-│           GHA Runner (ubuntu-latest)     │
-│                                          │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ libp2p   │  │ sing-box │            │
-│  │ DHT node │  │ (VLESS)  │            │
-│  │ :4001    │  │ :43124   │            │
-│  └────┬─────┘  └────┬─────┘            │
-│       │              │                   │
-│       ▼              ▼                   │
-│  ┌──────────────┐                       │
-│  │ cloudflared  │ ──► trycloudflare.com │
-│  │ tunnel       │     (public URL)      │
-│  └──────────────┘                       │
-│                                          │
-│  ┌──────────────┐                       │
-│  │ lifecycle.js │  TTL, respawn, death   │
-│  └──────────────┘                       │
-└─────────────────────────────────────────┘
-```
+- **n2n** — Default. Direct P2P, L2 adjacency, encrypted overlay. Works everywhere outbound UDP is allowed.
+- **bore** — Quick test, no secrets needed. Relay adds latency but is reliable.
+- **trycloudflare** — Need a public HTTPS endpoint (e.g. VLESS+WS for Hiddify)? CF tunnel gives you one. Traffic flows through Cloudflare's CDN.
+- **direct** — Raw STUN-based NAT punching. Low latency but fragile — many networks block it.
 
 ---
 
 ## 📂 Project Structure
 
 ```
-bpb-action/
-├── node/                  # 🆓 libp2p DHT mesh node
+backend/
+├── node/                  # libp2p DHT mesh node (optional DHT discovery)
 │   ├── src/
-│   │   ├── dht.ts         # Kademlia DHT node — discovery + config publication
-│   │   ├── lifecycle.ts   # TTL, spawn/announce/die state machine
-│   │   ├── respawn.ts     # GitHub API / git push triggers
-│   │   └── bootstrap.ts   # Peer bootstrapping strategies
+│   │   ├── dht.ts         # Kademlia DHT node lifecycle
+│   │   ├── announce.ts    # DHT provider publish + record server
+│   │   ├── discover.ts    # DHT discovery + record fetch + verify
+│   │   ├── signing.ts     # Ed25519 signing/verification
+│   │   ├── record.ts      # PublicProxyRecord creation + validation
+│   │   ├── types.ts       # Data model types
+│   │   ├── index.ts       # Entry point
+│   │   └── indexer.ts     # Standalone DHT indexer process
 │   └── package.json
 │
-├── client/                # 🆓 Client-side DHT resolver
+├── worker/                # Cloudflare Worker coordinator
 │   ├── src/
-│   │   ├── resolver.ts    # DHT resolver → Hiddify subscription format
-│   │   └── gateway.ts     # HTTP-to-DHT gateway (thin API for non-DHT clients)
-│   └── package.json
-│
-├── worker/                # ☁️ Coordinator (now optional tracker)
-│   ├── src/
-│   │   └── index.ts       # CF Worker: /bootstrap/peers, /sub/all, /sub/dht, /mesh/status
+│   │   └── index.ts       # register, heartbeat, sub/all, mesh/*, n2n endpoints
 │   ├── wrangler.toml
 │   └── package.json
 │
-├── src/                   # 📊 Dashboard panel
-│   ├── assets/panel/      # Web dashboard UI (dark mode, obviously)
-│   ├── server.ts           # Express + Socket.IO backend
-│   └── index.ts            # Entry point
+├── src/                   # Dashboard panel (Express + Socket.IO)
+│   ├── assets/panel/      # Web dashboard UI
+│   ├── server.ts
+│   └── index.ts
+│
+├── scripts/
+│   ├── animamesh-connect.sh   # 1-click n2n P2P client (Linux)
+│   ├── proxy-up.sh            # Trigger a proxy runner
+│   ├── proxy-down.sh          # Remove active proxies
+│   ├── proxy-status.sh        # Check proxy health
+│   └── stun_punch.py          # STUN-based direct NAT traversal
 │
 ├── .github/
 │   └── workflows/
-│       ├── mesh.yml        # 🆓 Multi-node matrix (2-5 concurrent runners)
-│       └── panel.yml       # Dashboard CI/CD
+│       ├── proxy.yml          # GHA runner: n2n/bore/cloudflared/direct tunnel
+│       └── panel.yml          # Dashboard CI/CD
 │
 ├── docs/
-│   ├── SPEC-V2-MESH.md    # Full architectural spec
-│   └── BRAINSTORM-PROMPT.md # Consillium brainstorm prompt
+│   ├── SPEC-V3-ANIMAMESH-BACKEND.md  # V3 backend spec (n2n, signing, mesh)
+│   ├── SPEC-V2-MESH.md                # Original DHT mesh spec + consillium decisions
+│   └── ANIMAMESH-CLIENT.md            # Linux client documentation
+│   # → See 📚 Specification Index below for section-level references
 │
-└── README.md               # You are here 📍
+└── README.md               # You are here
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🔑 Coordinator API
 
-> **Note:** v2 is still under construction. The quick start below covers what works today (v1-style) plus the DHT-enhanced path that's coming.
+The Worker exposes these endpoints. The n2n-specific ones are the heart of the P2P architecture.
+Full request/response schemas: [SPEC-V3 §9 Worker Coordinator Protocol](docs/SPEC-V3-ANIMAMESH-BACKEND.md).
 
-### Prerequisites
-
-1. A GitHub account (free tier works!)
-2. A Cloudflare account (free tier)
-3. [Hiddify](https://hiddify.com/) or any v2ray-compatible client
-
-### Step 1: Fork & Setup
-
-1. Fork this repository
-2. Go to **Settings → Secrets and variables → Actions**
-3. Add the following secrets:
-
-| Secret | Description | Example |
-|---|---|---|
-| `COORDINATOR_URL` | Your Cloudflare Worker URL | `https://bpb-coordinator.you.workers.dev` |
-| `AUTH_TOKEN` | Shared secret for auth | `your-secret-token-123` |
-| `NETWORK_ID` | 🆓 DHT mesh identifier | `my-mesh-42` |
-
-### Step 2: Deploy the Coordinator
-
-```bash
-git clone https://github.com/YOURUSERNAME/bpb-action.git
-cd bpb-action
-npm install -g wrangler
-wrangler login
-
-cd worker
-npm install
-wrangler deploy
-# Save the URL (e.g. https://bpb-coordinator.you.workers.dev)
-```
-
-### Step 3: Trigger the Mesh
-
-Push to `main` — this spawns the matrix:
-
-```bash
-echo "mesh go brrr" >> README.md
-git add -A && git commit -m "🚀 mesh trigger" && git push origin main
-```
-
-Or manually: **Actions → BPB Action Proxy → Run workflow** → select protocol → **Run workflow**.
-
-**Or use the KISS launcher (no TG bot needed!):**
-
-```bash
-# One command to start proxy + wait for subscription URL
-./scripts/proxy-up.sh --protocol hysteria2 --coordinator https://bpb-coordinator.you.workers.dev
-
-# Check status
-./scripts/proxy-status.sh --coordinator https://bpb-coordinator.you.workers.dev
-
-# Kill active proxies
-./scripts/proxy-down.sh
-```
-
-The scripts use `gh` (GitHub CLI) — install with `brew install gh` or see [cli.github.com](https://cli.github.com/).
-
-### Step 4: Get Your Subscription
-
-After ~2 minutes, grab your subscription URL:
-
-```
-📋 Coordinator subscription:
-   https://bpb-coordinator.you.workers.dev/sub/all
-
-🆓 DHT-native subscription (coming soon):
-   bpb-resolver resolve --network my-mesh-42 --format hiddify
-```
-
-### Step 5: Import into Hiddify
-
-1. Open **Hiddify** → **Subscriptions → Add**
-2. Paste the subscription URL
-3. Click **Update**
-4. Connect! 🌐
-
----
-
-## 🗺️ Implementation Roadmap (Post-Consillium)
-
-| Phase | Deliverable | Effort | Risk |
+| Endpoint | Method | Auth | Purpose |
 |---|---|---|---|
-| **P0** | Node runs libp2p DHT, announces proxy config | 2-3 days | Low |
-| **P1** | TTL-based lifecycle with git-push respawn | 1-2 days | Low |
-| **P2** | Coordinator gains DHT bridge (`/bootstrap/peers`, `/sub/dht`) | 1 day | Low |
-| **P3** | HTTP-to-DHT gateway (thin binary or CF Worker) | 2-3 days | Medium |
-| **P4** | Multi-node matrix + proactive overspawn | 1-2 days | Low |
-| **P5** | Tombstone + mesh self-healing + health metrics in DHT | 1-2 days | Medium |
-| **P6** | Parallel multiplexed tunnels (NOT serial multi-hop) | 3-5 days | High |
-| **P7** | Tunnel provider abstraction layer | 1-2 days | Low |
-| **P8** | DNS TXT + Gist + GossipSub bootstrap cascade | 2-3 days | Medium |
-| **P9** | Reputation system + PoW stake + random probes + 举报 incentives | 3-5 days | High |
+| `/mesh/n2n-config` | GET | None | Public: community name + supernode (no key) |
+| `/mesh/n2n-join` | POST | Bearer | Full n2n config: community + key + supernode |
+| `/mesh/register` | POST | Bearer | Runner registers signed proxy record |
+| `/mesh/heartbeat` | POST | Bearer | Runner refreshes TTL |
+| `/mesh/deregister` | POST | Bearer | Runner removes its record |
+| `/mesh/status` | GET | None | Active mesh nodes (JSON) |
+| `/mesh/snapshot` | GET | None | Signed snapshot of all records |
+| `/sub/all` | GET | None | Hiddify-compatible subscription (all proxies) |
+| `/sub/{id}` | GET | None | Single proxy subscription |
+| `/proxies` | GET | None | JSON proxy list |
+| `/register` | POST | Bearer | Legacy v1 registration |
+| `/heartbeat` | POST | Bearer | Legacy v1 heartbeat |
+| `/delete/{id}` | DELETE | Bearer | Remove proxy record |
+| `/health` | GET | None | Service health check |
 
 ---
 
-## ✅ Consillium Decisions (6 AIs: ChatGPT × Sonnet 4.5 × Gemini Pro × DeepSeek × Kimi 2.6 × GLM 5.1)
+## 🛡️ Threat Model
 
-Six AIs reviewed the spec and voted. Here's what they decided:
-
-| Q | ChatGPT | Sonnet 4.5 | Gemini Pro | DeepSeek | Kimi 2.6 | GLM 5.1 | **Decision** |
-|---|---|---|---|---|---|---|---|
-| Q1 Bootstrap | coord+bootstrap | gossipsub+git | DNS TXT | DNS+户籍 | gossipsub+git | **DNS+墓碑** | **Layered cascade** |
-| Q2 Client DHT | HTTP gateway | HTTP gateway | IPNS | B+特色 | **B+role** | **B+驿站** | **HTTP-to-DHT gateway** |
-| Q3 Multi-hop | design now | design now | skip | B+留白 | **parallel** | **KILL IT** | **Dead. No serial multi-hop.** |
-| Q4 Respawn | overspawn | overspawn | accept gap | C+禅让 | **C+litters** | **C+父死子继** | **Proactive overspawn** |
-| Q5 Network ID | invite codes | secrets+invites | repo secrets | A+C+差序格局 | **C+delegable** | **门派制** | **Secrets + invites** |
-| Q6 Tunnel | multi-provider | multi+relay | multi-provider | B+农村 | **E=destiny** | **B+暗网潜行** | **Multi-provider + relay hatch** |
-| **Q7 Defection** | — | — | — | 仓颉审计 | — | **锦+推恩** | **Reputation + PoW + 举报** |
-
-**Q1: DHT Bootstrap → Layered Cascade 🐔🥚**
-All three picked different primaries. Synthesis: try everything in order — DNS TXT → coordinator → GossipSub → git-persisted peers → public bootstrap nodes → hardcoded seeds. *Gemini's insight: "DNS is the most resilient, globally cached read-only database in existence. Bitcoin, Tor, and IPFS all use it as ultimate fallback."*
-
-**Q2: Client-Side DHT → HTTP-to-DHT Gateway 🪶**
-Thin Go/Rust binary that embeds libp2p, exposes `GET /resolve/{net-id}` → Hiddify JSON. Client apps stay dumb. *Sonnet's bonus: any mesh node can act as DHT proxy via JSON-RPC.*
-
-**Q3: Multi-Hop Relay → KILLED BY CONSIILLUM ☠️🔗**
-Serial multi-hop is architecturally wrong for ephemeral environments. MTBF of a 3-hop circuit with 15-60min nodes is *minutes*. GLM 5.1 says: "remove `route: []` from schema entirely — it's code debt violating YAGNI." Gemini + Kimi agree. Instead: **parallel multiplexing**. Client opens 3 single-hop tunnels — one "主轨" (primary), two "暗轨" (dark tracks, heartbeat only, zero-latency switchover). Like high-speed rail's redundant power grid. Serial multi-hop belongs to Tor. Not here.
-
-**Q4: Respawn Race → Proactive Overspawn ⏱️**
-Maintain N+1 nodes. When a node hits 50% TTL, spawn replacement. Kubernetes thinking. *Concession to Gemini: if overspawn fails (API rate limits), the mesh degrades gracefully to "accept the gap" mode.*
-
-**Q5: Network Identity → Repo Secrets + Optional Invites 🏷️**
-Default: network-id in repo secrets (one darknet per fork). Optional: coordinator issues time-limited invitation codes for "join my mesh." *Gemini's warning: "A public mesh will immediately attract abuse, becoming a target for GitHub's Trust & Safety bans."*
-
-**Q6: Tunnel SPOF → Multi-Provider + Relay Escape Hatch ⛓️**
-Tunnel cascade: trycloudflare → bore.pub → localhost.run → ngrok → VPS relay → libp2p circuit relay. Abstract behind `TunnelProvider` interface. *Gemini's wildcard: Tor Onion Services as a tunnel provider — absolute anonymity, zero corporate dependency.*
-
-**Q7: Node Defection → Reputation + PoW Stake 🐉** *(DeepSeek's new question — the other three missed it)*
-What stops a node from going rogue? Fake configs, traffic logging, Sybil flood. DeepSeek's answer: 仓颉审计 (Cangjie Audit) — trust is earned, not given. Zero trust on spawn. Track uptime + performance. Nodes vouch for each other (连坐制 — collective accountability). Probe traffic catches loggers. PoW stake at join time makes Sybil expensive. Sponsor vouching: if your sponsored node defects, you lose reputation too. *DeepSeek: "制度大于人心 — systems over sentiment. Make punishment certain, not severe."
-
-**Key cross-cutting principles from consillium:**
-- *"Do not optimize for no coordinator. Optimize for coordinator compromise is survivable."* — ChatGPT
-- *"Ephemeral infrastructure as highly hostile territory. This is a continuous rolling blackout."* — Gemini
-- *"Control plane / data plane separation is sacred."* — Unanimous
-- *"阴阳平衡 — yin-yang balance between centralized structure and decentralized resilience."* — DeepSeek
-- *"制度大于人心 — systems over sentiment."* — DeepSeek
-- *"Immortal liquidity through constant death."* — Kimi 2.6
-- *"Client fault-tolerance is 70% of viability. Architecture is 30%."* — GLM 5.1
-- *"Serial multi-hop is dead. Killed by this consillium."* — GLM 5.1 + Gemini + Kimi 2.6
-
-Full details in `docs/SPEC-V2-MESH.md` §8.
-
----
-
-## ⚖️ Constraints & Principles
-
-1. **🧪 Pure science.** This is a research experiment in decentralized ephemeral proxy meshes. No production. No users. No liability.
-2. **🔍 libp2p for discovery ONLY.** Data path = VLESS/Hy2 directly. Never route traffic through libp2p. Non-negotiable. *(Unanimous consillium agreement.)*
-3. **📡 Coordinator is optional.** The mesh must work without it. It's a BitTorrent tracker, not a server. *(ChatGPT: "Optimize for coordinator compromise is survivable, not for no coordinator.")*
-4. **⏳ Ephemeral by design.** Nodes live minutes, not days. No persistent state. Identity is per-lifecycle. *(Gemini: "Treat this as highly hostile territory — a continuous rolling blackout.")*
-5. **🔙 Backward compatible.** v1 clients (using `/sub/all` on coordinator) must keep working. No breaking upgrades.
-6. **📦 Minimal dependencies.** Prefer npm packages over custom protocols. Prefer standard libp2p protocols over ad-hoc messaging. Don't reinvent wheels.
-7. **🔀 Stagger, don't sync.** Random TTLs. Jittered announces. No herd behavior. Entropy is our friend.
-8. **🪜 Layered resilience.** Every critical function (bootstrap, tunnel, discovery) has a cascade of fallbacks. No single mechanism is trusted alone.
-9. **❤️ Health over liveness.** DHT records carry health scores. Clients pick best nodes, not just any node.
-10. **⚡ Parallel beats serial.** Client-side multiplexing > serial multi-hop for resilience. Three parallel single-hop tunnels beat one three-hop circuit.
-11. **🐉 Trust is earned, not given.** Every node starts at zero trust. Reputation accumulates through uptime, consistency, and peer vouching. Sybil attacks must burn time and compute. *(DeepSeek: 制度大于人心 — systems over sentiment.)*
-12. **☯️ 阴阳平衡.** Every layer needs both centralized structure and decentralized resilience. Bootstrap = yang. DHT = yin. Authorization = balanced. Defection defense = yang inside yin. *(DeepSeek.)*
-13. **💀 Serial multi-hop is dead.** Killed by consensus of 6 AIs. Removed from schema. Parallel multiplexing (主轨+暗轨) is the resilience model. *(GLM 5.1: "Remove `route: []` — it's code debt violating YAGNI.")*
-14. **🚂 Client retry = 70% of viability.** Architecture is 30%. Clients must implement relentless degradation: 1 fail → probe, 3 fails → dead + resubscribe. *(GLM 5.1.)*
+| Threat | Mitigation |
+|---|---|
+| **Coordinator compromise** | Coordinator is control-plane only. No proxy traffic flows through it. Signed records (Ed25519) prevent metadata tampering. See [SPEC-V3 §5 Trust Model](docs/SPEC-V3-ANIMAMESH-BACKEND.md) and [SPEC-V2 §6 Threat Model](docs/SPEC-V2-MESH.md). |
+| **n2n key leak** | Anyone with the key can join the overlay — but they still need per-run Hysteria2 passwords to use proxies (from `/sub/all`). Two-factor: network access + app auth. |
+| **Supernode MITM** | n2n encrypts peer-to-peer traffic with AES using the community key. The supernode only sees encrypted UDP packets and peer coordinates — never plaintext. |
+| **Other n2n peers** | Hysteria2 password is per-run, random. Even other peers on the same overlay can't use your proxy. |
+| **Runner dies** | Ephemeral by design. 45-minute TTL. No persistent state. Trigger a new one with `proxy-up.sh`. |
+| **Sybil attack** | Network-ID = shared secret. Coordinator auth-gates registration. DHT records signed with Ed25519. See [SPEC-V2 §8 Q7 Defection](docs/SPEC-V2-MESH.md). |
+| **Ghost nodes** | Short TTL, heartbeat every 5 minutes, tombstones on deregister. |
 
 ---
 
 ## ❓ FAQ
 
 **Is this free?**
-Yes! GitHub Actions free tier gives you 2,000 minutes/month. Each node uses 15-60 min. The mesh draws ~3 nodes at a time, so ~45-180 min per "mesh hour." Do the math. 🧮
+Yes. GitHub Actions free tier gives 2,000 minutes/month. Each runner uses ~45 min. The mesh draws 1-3 nodes at a time. You can run for many hours before hitting limits.
 
-**How is this different from v1?**
-v1 had one runner, one coordinator, one point of failure. v2 has a **mesh** — multiple nodes, DHT discovery, self-healing. The coordinator is now optional (a BitTorrent tracker, not a server). If it dies, the mesh keeps working.
+**Do I need a VPS?**
+No. That's the whole point. n2n uses public supernodes (free) to broker the initial connection. Once both peers are on the overlay, traffic flows directly between them.
 
-**Wait, why is libp2p NOT in the data path?**
-Because that's the whole point. DHT is for *finding* nodes, not *routing traffic through* them. Same reason BitTorrent uses DHT to find peers but transfers files directly between them. Putting libp2p in the data path would add latency, complexity, and a single protocol dependency. VLESS/Hysteria2 are purpose-built for proxying. Let them do their job.
+**What if the supernode is down?**
+Try an alternative. Set `N2N_SUPERNODE` secret or pass `--supernode` to `animamesh-connect.sh`:
 
-**What if the coordinator goes down?**
-The mesh continues on DHT alone. Coordinator = BitTorrent tracker. Nice to have, not required. It degrades gracefully: online+DHT = best, offline+DHT = fine, online-only = legacy fallback.
+| Supernode | Location |
+|---|---|
+| `supernode.ntop.org:7777` | Official ntop (default) |
+| `vps.luckynet.info:7777` | Europe/CIS |
+| `n2n.luckynet.info:7777` | Fallback |
+| `supernode.lucaswilliams.co.uk:7777` | UK |
 
-**How do nodes find each other if they're all ephemeral?**
-Multiple bootstrap strategies: coordinator bootstrap endpoint, last-known peers from git, public libp2p bootstrap nodes, and the DHT itself (once at least one node is alive, others find it). The chicken-and-egg problem is real — see Q1 in the open questions.
+**Is traffic encrypted?**
+Twice. n2n encrypts the wire between peers (AES with community key). Hysteria2 adds QUIC+TLS on top with its own password. Even if someone sniffs the supernode, they see encrypted UDP. Even if another n2n peer inspects traffic, they see QUIC ciphertext.
 
-**Is my traffic encrypted?**
-Yes. VLESS and Hysteria2 are encrypted protocols. Traffic between you and the proxy node is encrypted. The DHT is public metadata (node configs, not your traffic).
+**Why two passwords?**
+n2n key = join the WiFi. Hysteria2 password = use the proxy. Other peers on the same n2n community can ping you but can't proxy through you without the per-run password.
 
-**Can I use this for... reasons?**
-Educational purposes only. Respect GitHub's ToS. Respect local laws. This is a science experiment, not a service. 🧪
+**Is this Tor?**
+No. Tor is a production-grade multi-hop onion network with thousands of nodes and decades of security research. This is a weekend experiment that puts proxy nodes in GitHub Actions and connects to them via n2n. Philosophy-wise? Same neighborhood. Security-wise? Not even close.
+
+**Can I use Hiddify instead of the Linux client?**
+If you're using `trycloudflare` tunnel mode, yes — `GET /sub/all` returns standard v2ray subscription links. For n2n mode, you need to join the n2n overlay first (the Linux client does this automatically). Stock Hiddify doesn't speak n2n.
 
 **Why Hysteria2 vs VLESS?**
-Hysteria2: no TLS cert needed, QUIC-based, faster on lossy networks.
-VLESS: more widely supported, WebSocket transport plays nice with CDN.
-Both are first-class in the mesh. Your call.
+Hysteria2: QUIC-based, fast on lossy networks, no TLS cert needed, works great over n2n.
+VLESS: more widely supported, WebSocket transport works through CDNs.
+Both are first-class. Hysteria2 is the recommended default for n2n mode.
 
-**Is this... Tor?**
-lol no. Tor is a production-grade, multi-hop onion routing network with thousands of nodes and decades of security research. This is a weekend project that runs proxy nodes in GitHub Actions and finds them via DHT. But philosophy-wise? Same neighborhood. Three AIs reviewed the design — two say "design for multi-hop later," one says "skip it entirely." Interestingly, Gemini pointed out that 3 parallel single-hop tunnels (multiplexing) beat 1 serial 3-hop circuit for our use case. So the "your own Tor" line is a vibe, not a security claim. But we're building the scaffolding for it.
+**What about DHT?**
+The libp2p DHT (`node/`) is an optional discovery layer. The Worker coordinator is the primary discovery path today. DHT adds resilience for when the Worker is down — but for most users, the Worker is perfectly fine. See [SPEC-V2 §3.1 DHT Discovery Layer](docs/SPEC-V2-MESH.md) and [SPEC-V3 §8 DHT Protocol](docs/SPEC-V3-ANIMAMESH-BACKEND.md) for the full architecture.
+
+---
+
+## 📚 Specification Index
+
+All design documents, kept for research and architectural reference.
+
+| Document | What it covers | When to read it |
+|---|---|---|
+| [`SPEC-V3-ANIMAMESH-BACKEND.md`](docs/SPEC-V3-ANIMAMESH-BACKEND.md) | **V3 implementation spec** — data models (`PublicProxyRecord`, `SignedSnapshot`), Ed25519 signing, Worker V3 mesh endpoints (`/mesh/register`, `/mesh/heartbeat`, `/mesh/snapshot`), DHT rendezvous protocol, subscription generation, runner lifecycle, IPFS mirroring, testing plan | Before modifying `worker/src/index.ts`, `node/src/`, or `proxy.yml` |
+| [`SPEC-V2-MESH.md`](docs/SPEC-V2-MESH.md) | **Original mesh architecture** — DHT topology (Kademlia), lifecycle state machine (SPAWN → DEREGISTER → DIE), 7-AI consillium decisions (bootstrap cascade, multi-hop killed, proactive overspawn, tunnel provider cascade, reputation/PoW stake), threat model, implementation roadmap | For DHT design rationale, consillium voting records (§8), and historical context |
+| [`ANIMAMESH-CLIENT.md`](docs/ANIMAMESH-CLIENT.md) | **Linux client docs** — `animamesh-connect.sh` usage, n2n join flow, proxy discovery, Hysteria2 SOCKS5 setup, troubleshooting, alternative supernodes | Before using or modifying `scripts/animamesh-connect.sh` |
+
+### Key sections by topic
+
+| Topic | SPEC-V3 | SPEC-V2 | Client doc |
+|---|---|---|---|
+| Data models & signing | §6 `PublicProxyRecord`, §7 signing model | — | — |
+| Worker mesh API | §9 `/mesh/register`, `/mesh/heartbeat`, `/mesh/status`, `/mesh/snapshot` | — | — |
+| n2n P2P overlay | (implemented, see proxy.yml + worker) | — | Architecture diagram, Step-by-step flow |
+| DHT rendezvous keys | §8 `/bpb/v2/{net-id}/{protocol}/{peer-id}` | §3.1 DHT Discovery Layer, §8 Q1 bootstrap cascade | — |
+| Subscription generation | §10 Hysteria2 link, VLESS WS link, secret material | — | How proxies are discovered from `/sub/all` |
+| Runner lifecycle | §11 workflow inputs, TTL, respawn | §3.3 Ephemeral Lifecycle Manager | — |
+| 6-AI consillium decisions | — | §8 voting matrix + per-question analysis | — |
+| Threat model | §5 trust boundaries, untrusted actors | §6 full threat table | — |
+| IPFS/IPNS mirroring | §13 optional, `SignedSnapshot` to IPFS | — | — |
+| Implementation phases | §15 Phase 1–5, §16 file-by-file changes | §9 roadmap P0–P9 | — |
+| Testing plan | §17 unit, integration, workflow smoke | — | — |
 
 ---
 
 ## 🤝 Contributing
 
-This is a research project. Fork it, break it, improve it. PRs welcome, but expect things to change fast. The spec is still a draft.
+Research project. Fork it, break it, improve it. PRs welcome.
 
-See `docs/SPEC-V2-MESH.md` for the full architectural specification and `docs/BRAINSTORM-PROMPT.md` for the consillium prompt.
+See the [Specification Index](#-specification-index) above for all design documents.
 
 ---
 
