@@ -295,7 +295,7 @@ jobs:
       # --- Step 6: Register with coordinator ---
       # Build JSON payload as a temp file to avoid shell quoting nightmares.
       - name: Register proxy
-        if: secrets.COORDINATOR_URL != ''
+        if: ${{ secrets.COORDINATOR_URL != '' }}
         env:
           MESH_SIGNING_PRIVATE_KEY: ${{ secrets.MESH_SIGNING_PRIVATE_KEY || '' }}
           PROTOCOL: ${{ github.event.inputs.protocol }}
