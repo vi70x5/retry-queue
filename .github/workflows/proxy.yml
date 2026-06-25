@@ -302,6 +302,10 @@ jobs:
           PROTOCOL: ${{ github.event.inputs.protocol }}
           TUNNEL: ${{ github.event.inputs.tunnel }}
         run: |
+          echo "🔍 DEBUG: COORDINATOR_URL=[${COORDINATOR_URL:-EMPTY}]"
+          echo "🔍 DEBUG: AUTH_TOKEN=[${AUTH_TOKEN:+SET}]"
+          echo "🔍 DEBUG: TUNNEL_HOST=[${TUNNEL_HOST:-EMPTY}]"
+          echo "🔍 DEBUG: TUNNEL_PORT=[${TUNNEL_PORT:-EMPTY}]"
           if [ -z "${COORDINATOR_URL:-}" ]; then
             echo "ℹ️ No COORDINATOR_URL set — skipping registration."
             echo "   To enable, set the COORDINATOR_URL repo secret."
