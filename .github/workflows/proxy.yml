@@ -294,13 +294,19 @@ jobs:
 
       # --- Step 6: Register with coordinator ---
       # Build JSON payload as a temp file to avoid shell quoting nightmares.
+      # NOTE: We use a shell guard instead of `if: env.COORDINATOR_URL != ''` because
+      #       the env context from secrets is sometimes not populated at if-evaluation time.
       - name: Register proxy
-        if: ${{ secrets.COORDINATOR_URL != '' }}
         env:
           MESH_SIGNING_PRIVATE_KEY: ${{ secrets.MESH_SIGNING_PRIVATE_KEY || '' }}
           PROTOCOL: ${{ github.event.inputs.protocol }}
           TUNNEL: ${{ github.event.inputs.tunnel }}
         run: |
+          if [ -z "${COORDINATOR_URL:-}" ]; then
+            echo "ℹ️ No COORDINATOR_URL set — skipping registration."
+            echo "   To enable, set the COORDINATOR_URL repo secret."
+            exit 0
+          fi
           echo "📡 Registering with coordinator..."
           PROXY_ID="gha-$GITHUB_RUN_ID"
           CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
