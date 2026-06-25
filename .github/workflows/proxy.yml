@@ -12,15 +12,15 @@ on:
           - vless
           - hysteria2
       tunnel:
-        description: "Tunnel provider (serveo=SSH TCP relay, trycloudflare=HTTP/WS via Cloudflare, direct=STUN P2P, n2n=P2P VPN overlay)"
+        description: "Tunnel provider (trycloudflare=HTTP/WS via Cloudflare, direct=STUN P2P, n2n=P2P VPN overlay, serveo=HTTP tunnel via SSH, experimental)"
         required: true
-        default: "serveo"
+        default: "trycloudflare"
         type: choice
         options:
-          - serveo
           - trycloudflare
           - direct
           - n2n
+          - serveo
 
 env:
   COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
@@ -168,8 +168,8 @@ jobs:
           fi
 
       # --- Step 4: Create VLESS config ---
-      # For TryCloudflare, we use WebSocket transport.
-      # For Serveo/n2n/direct tunnels, use raw TCP transport.
+      # For TryCloudflare and Serveo (HTTP tunnels), use WebSocket transport.
+      # For n2n/direct tunnels, use raw TCP transport.
       - name: Setup sing-box (VLESS)
         if: github.event.inputs.protocol == 'vless'
         env:
@@ -200,40 +200,32 @@ jobs:
             cat /tmp/singbox.log
           fi
 
-      # --- Step 5a: Setup Serveo TCP Tunnel (SSH-based, no binary download) ---
+      # --- Step 5a: Setup Serveo HTTP Tunnel (SSH-based, HTTP only on free tier) ---
       - name: Setup Serveo Tunnel
         if: github.event.inputs.tunnel == 'serveo'
         run: |
-          echo "🌐 Setting up Serveo TCP Tunnel (SSH-based, no download)..."
+          echo "🌐 Setting up Serveo HTTP Tunnel (SSH-based)..."
+          echo "⚠️ Serveo free tier creates an HTTP tunnel with a warning page."
+          echo "   Works best with VLESS+WebSocket. For raw TCP, use trycloudflare."
 
-          # Serveo uses SSH — already available on ubuntu-latest
-          # -R 0:localhost:PORT = request a random TCP port on the relay
-          # serveo.net = free SSH TCP relay
+          # Serveo free tier only supports HTTP subdomain forwarding
+          # -R 80:localhost:PORT = HTTP tunnel with random subdomain
           nohup ssh -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 \
-            -R 0:localhost:${{ steps.creds.outputs.port }} \
+            -R 80:localhost:${{ steps.creds.outputs.port }} \
             serveo.net > /tmp/tunnel.log 2>&1 &
           sleep 10
 
-          # Parse assigned TCP port from Serveo output
-          # Format: "Forwarding TCP traffic from serveo.net:PORT"
-          SERVEO_PORT=$(grep -oE 'serveo\.net:[0-9]+' /tmp/tunnel.log | grep -oE '[0-9]+' | head -n1 || echo "")
-          # Fallback: HTTP subdomain format (serveousercontent.com)
-          if [ -z "$SERVEO_PORT" ]; then
-            SERVEO_HOST=$(grep -oE 'https://[a-z0-9-]+\.serveousercontent\.com' /tmp/tunnel.log | head -n1 || echo "")
-            if [ -n "$SERVEO_HOST" ]; then
-              SERVEO_HOST=$(echo "$SERVEO_HOST" | sed 's|https://||')
-              echo "TUNNEL_HOST=$SERVEO_HOST" >> $GITHUB_ENV
-              echo "TUNNEL_PORT=443" >> $GITHUB_ENV
-              echo "🌍 Tunnel URL: https://$SERVEO_HOST"
-            fi
-          else
-            echo "TUNNEL_HOST=serveo.net" >> $GITHUB_ENV
-            echo "TUNNEL_PORT=$SERVEO_PORT" >> $GITHUB_ENV
-            echo "🌍 Tunnel URL: serveo.net:$SERVEO_PORT"
-          fi
+          # Parse assigned subdomain from Serveo output
+          # Format: "Forwarding HTTP traffic from https://<hash>-<ip>.serveousercontent.com"
+          SERVEO_HOST=$(grep -oE 'https://[a-z0-9-]+\.serveousercontent\.com' /tmp/tunnel.log | head -n1 || echo "")
 
-          if [ -z "$SERVEO_PORT" ] && [ -z "$SERVEO_HOST" ]; then
+          if [ -n "$SERVEO_HOST" ]; then
+            SERVEO_HOST=$(echo "$SERVEO_HOST" | sed 's|https://||')
+            echo "TUNNEL_HOST=$SERVEO_HOST" >> $GITHUB_ENV
+            echo "TUNNEL_PORT=443" >> $GITHUB_ENV
+            echo "🌍 Tunnel URL: https://$SERVEO_HOST"
+          else
             echo "⚠️ Failed to get Serveo endpoint. Log:"
             cat /tmp/tunnel.log
             exit 1
@@ -332,7 +324,8 @@ jobs:
           CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
           # Determine VLESS transport params based on selected tunnel
-          if [ "${{ github.event.inputs.tunnel }}" == "trycloudflare" ]; then
+          # HTTP tunnels (trycloudflare, serveo) need WebSocket transport
+          if [ "${{ github.event.inputs.tunnel }}" == "trycloudflare" ] || [ "${{ github.event.inputs.tunnel }}" == "serveo" ]; then
             TYPE_PARAM="ws"
             PATH_PARAM="/ws"
             SECURITY_PARAM="tls"
