@@ -1,4 +1,4 @@
-name: BPB Action Proxy
+name: CI Pipeline
 
 on:
   workflow_dispatch:
