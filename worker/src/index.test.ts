@@ -84,8 +84,6 @@ const makeUnsignedRecord = (
 	const now = new Date();
 	const expiresAt = new Date(now.getTime() + 30 * 60 * 1000).toISOString();
 	return {
-		schema: "animamesh.proxy.v1",
-		networkId: "animamesh-test",
 		nodeId: "node-test-1",
 		run: {
 			repository: "owner/repo",
@@ -755,7 +753,6 @@ describe("fetch router", () => {
 			const { keyPair, publicKeyBase64 } = await generateMeshKeyPair();
 			const env = makeEnv({
 				AUTH_TOKEN: "test-token",
-				NETWORK_ID: "animamesh-test",
 				VLESS_UUID: "env-vless-uuid",
 				HY2_PASSWORD: "env-hy2-password",
 				MESH_PUBLIC_KEYS: JSON.stringify({ "kid-test": publicKeyBase64 }),
@@ -1720,7 +1717,6 @@ describe("verifyPublicRecord", () => {
 		publicKeyBase64 = generated.publicKeyBase64;
 		env = makeEnv({
 			AUTH_TOKEN: "test-token",
-			NETWORK_ID: "animamesh-test",
 			MESH_PUBLIC_KEYS: JSON.stringify({ "kid-test": publicKeyBase64 }),
 		});
 	});

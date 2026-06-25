@@ -1,5 +1,3 @@
-// Animamesh — libp2p DHT rendezvous provider module
-// Spec: SPEC-V3-ANIMAMESH-BACKEND.md §8
 
 import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
@@ -20,14 +18,12 @@ import { sha256 } from "multiformats/hashes/sha2";
  *
  * The DHT uses provider records keyed by this string (hashed to a CID).
  *
- * @param networkId  Logical mesh network (e.g. "animamesh-main").
  * @param protocol   "vless", "hysteria2", or "all" for cross-protocol discovery.
  */
 export function rendezvousKey(
 	networkId: string,
 	protocol: "vless" | "hysteria2" | "all",
 ): string {
-	return `animamesh:v1:${networkId}:${protocol}`;
 }
 
 /**
@@ -69,7 +65,6 @@ export interface StartedNode {
 }
 
 /**
- * Create and start a libp2p node configured for the Animamesh DHT mesh.
  *
  * Sets up:
  * - TCP transport (WebSocket transport is not included — add if needed)

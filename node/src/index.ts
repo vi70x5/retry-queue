@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 /**
- * Animamesh — libp2p DHT mesh node entry point.
  *
  * This is a run-on-import script designed to be executed directly with `tsx`:
  *
@@ -74,7 +73,6 @@ function configFromEnv(): MeshNodeConfig {
 	const ttlMinutes = getEnvNumber("TTL_MINUTES", 45);
 
 	const config: MeshNodeConfig = {
-		networkId: getEnv("NETWORK_ID", "animamesh-main"),
 		protocol,
 		proxyHost: getEnv("PROXY_HOST", "127.0.0.1"),
 		proxyPort: getEnvNumber("PROXY_PORT", 0),
@@ -278,7 +276,6 @@ async function shutdown(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-	console.log("[node] Animamesh DHT mesh node starting");
 
 	// 1. Configuration
 	const config = configFromEnv();
@@ -325,7 +322,6 @@ async function main(): Promise<void> {
 	// 6. Start record server
 	startRecordServer(node, record);
 	console.log(
-		"[node] Record server listening on /animamesh/proxy-record/1.0.0",
 	);
 
 	// 7. Heartbeat loop

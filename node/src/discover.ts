@@ -1,5 +1,3 @@
-// Animamesh — DHT discovery and record fetching module
-// Spec: SPEC-V3-ANIMAMESH-BACKEND.md §8 (Discover Flow)
 
 import type { KadDHT } from "@libp2p/kad-dht";
 import type { PeerId } from "@libp2p/peer-id";
@@ -30,7 +28,6 @@ export interface DiscoverProvidersOptions {
  * rendezvous key via the DHT.
  *
  * Calls `dht.findProviders()` on the CID derived from the rendezvous key
- * `animamesh:v1:{networkId}:{protocol}` and returns a list of `DiscoveredRecord`
  * entries containing peer identity and multiaddrs (without the actual
  * `PublicProxyRecord` — use `fetchRecord` to retrieve that).
  *
@@ -88,7 +85,6 @@ export interface FetchRecordOptions {
 
 /**
  * Dial a peer and fetch its `PublicProxyRecord` over the
- * `/animamesh/proxy-record/1.0.0` protocol.
  *
  * 1. Opens a stream to the peer using the given multiaddrs.
  * 2. Reads one length-prefixed JSON message.
@@ -106,7 +102,6 @@ export async function fetchRecord(
 	try {
 		const stream = await node.dialProtocol(
 			peerId,
-			["/animamesh/proxy-record/1.0.0"],
 			{
 				signal: options?.signal,
 			},
@@ -212,7 +207,6 @@ export async function discoverAndVerify(
 		const rec = entry.record;
 
 		// Structural checks
-		if (rec.schema !== "animamesh.proxy.v1") continue;
 		if (rec.networkId !== networkId) continue;
 		if (rec.protocol !== protocol) continue;
 		if (isRecordExpired(rec)) continue;

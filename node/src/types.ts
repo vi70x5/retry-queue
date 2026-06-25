@@ -1,5 +1,3 @@
-// Animamesh — Data models for the DHT mesh node
-// Mirrors the spec at SPEC-V3-ANIMAMESH-BACKEND.md §6
 
 export type MeshProtocol = "vless" | "hysteria2";
 
@@ -12,7 +10,6 @@ export type MeshIngress =
 	| "n2n";
 
 export interface PublicProxyRecord {
-	schema: "animamesh.proxy.v1";
 	networkId: string;
 	nodeId: string;
 	run?: {
@@ -60,7 +57,6 @@ export interface DiscoveredRecord {
 }
 
 export interface SignedSnapshot {
-	schema: "animamesh.snapshot.v1";
 	networkId: string;
 	generatedAt: string;
 	expiresAt: string;

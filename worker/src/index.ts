@@ -1,11 +1,4 @@
 /**
- * BPB Action Panel - Cloudflare Worker Coordinator
- *
- * Coordinates between GitHub Actions runners and end users.
- * Receives proxy configs from runners, serves Hiddify subscriptions.
- *
- * Auth: AUTH_TOKEN secret must be set. Runners pass it as Bearer token.
- * Storage: KV (persistent) or in-memory (fallback, resets on redeploy).
  */
 
 export interface Env {
@@ -134,7 +127,6 @@ export type MeshIngress =
 	| "n2n";
 
 export interface PublicProxyRecord {
-	schema: "animamesh.proxy.v1";
 	networkId: string;
 	nodeId: string;
 	run?: {
@@ -171,7 +163,6 @@ export interface PublicProxyRecord {
 }
 
 export interface SignedSnapshot {
-	schema: "animamesh.snapshot.v1";
 	networkId: string;
 	generatedAt: string;
 	expiresAt: string;
@@ -376,7 +367,6 @@ export async function verifyPublicRecord(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
 	if (!record || typeof record !== "object")
 		return { ok: false, error: "Missing record" };
-	if (record.schema !== "animamesh.proxy.v1")
 		return { ok: false, error: "Unsupported schema" };
 	if (env.NETWORK_ID && record.networkId !== env.NETWORK_ID) {
 		return { ok: false, error: "Wrong networkId" };
@@ -822,7 +812,6 @@ export default {
 					records.map((record) => record.lifecycle.expiresAt).sort()[0] ||
 					new Date(Date.now() + 15 * 60 * 1000).toISOString();
 				const snapshot: SignedSnapshot = {
-					schema: "animamesh.snapshot.v1",
 					networkId: env.NETWORK_ID || records[0]?.networkId || "default",
 					generatedAt,
 					expiresAt,

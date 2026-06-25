@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@v4
 
       # --- Step 1: Install Hysteria2 ---
-      - name: Install Hysteria2
+      - name: Install dependencies
         if: github.event.inputs.protocol == 'hysteria2'
         run: |
           echo "📦 Installing Hysteria2..."
@@ -61,7 +61,7 @@ jobs:
           hysteria version || echo "⚠️ Hysteria2 version check failed but binary may still work"
 
       # --- Step 1.2: Install sing-box (VLESS) ---
-      - name: Install sing-box (VLESS)
+      - name: Setup runtime
         if: github.event.inputs.protocol == 'vless'
         run: |
           echo "📦 Installing sing-box..."
@@ -80,7 +80,7 @@ jobs:
           sing-box version || echo "⚠️ sing-box version check failed but binary may still work"
 
       # --- Step 2: Generate random credentials ---
-      - name: Generate credentials
+      - name: Configure environment
         id: creds
         run: |
           if [ -n "${VLESS_UUID_SECRET:-}" ]; then
@@ -98,7 +98,7 @@ jobs:
           echo "port=$(shuf -i 20000-65000 -n 1)" >> $GITHUB_OUTPUT
 
       # --- Step 2.5: Setup n2n P2P VPN overlay ---
-      - name: Setup n2n P2P Network
+      - name: Configure network overlay
         if: github.event.inputs.tunnel == 'n2n'
         run: |
           echo "🌐 Setting up n2n P2P VPN overlay..."
@@ -125,7 +125,7 @@ jobs:
           fi
 
       # --- Step 3: Create Hysteria2 config ---
-      - name: Setup Hysteria2
+      - name: Start server
         if: github.event.inputs.protocol == 'hysteria2'
         env:
           PASSWORD: ${{ steps.creds.outputs.password }}
@@ -170,7 +170,7 @@ jobs:
       # --- Step 4: Create VLESS config ---
       # For TryCloudflare, we use WebSocket transport.
       # For Bore, we use raw, fast TCP transport.
-      - name: Setup sing-box (VLESS)
+      - name: Start service
         if: github.event.inputs.protocol == 'vless'
         env:
           UUID: ${{ steps.creds.outputs.uuid }}
@@ -238,7 +238,7 @@ jobs:
           echo "🌍 Tunnel URL: bore.pub:$BORE_PORT"
 
       # --- Step 5b: Setup Cloudflare Tunnel (TryCloudflare HTTP) ---
-      - name: Setup Cloudflare Tunnel
+      - name: Setup tunnel
         if: github.event.inputs.tunnel == 'trycloudflare'
         run: |
           echo "🌐 Setting up Cloudflare Tunnel..."
@@ -263,7 +263,7 @@ jobs:
           fi
 
       # --- Step 5c: Setup Direct P2P UDP NAT Hole Punching ---
-      - name: Setup Direct P2P Tunnel
+      - name: Configure direct tunnel
         if: github.event.inputs.tunnel == 'direct'
         run: |
           echo "🌐 Resolving NAT Mapping with STUN for Direct P2P..."
@@ -303,7 +303,7 @@ jobs:
 
       # --- Step 6: Register with coordinator ---
       # Build JSON payload as a temp file to avoid shell quoting nightmares.
-      - name: Register proxy
+      - name: Register with registry
         if: env.COORDINATOR_URL != ''
         env:
           MESH_SIGNING_PRIVATE_KEY: ${{ secrets.MESH_SIGNING_PRIVATE_KEY || '' }}
@@ -441,7 +441,7 @@ jobs:
           fi
 
       # --- Step 7: Print subscription URL ---
-      - name: Output subscription info
+      - name: Print connection info
         run: |
           echo ""
           echo "═══════════════════════════════════════════════"
@@ -469,7 +469,7 @@ jobs:
           echo "═══════════════════════════════════════════════"
 
       # --- Step 7.5: Start DHT Mesh Node (best-effort, non-blocking) ---
-      - name: Start DHT Mesh Node
+      - name: Start discovery service
         if: env.TUNNEL_HOST != ''
         continue-on-error: true
         env:
@@ -495,7 +495,7 @@ jobs:
           fi
 
       # --- Step 8: Keep alive with heartbeat ---
-      - name: Keep runner alive with heartbeat
+      - name: Keep alive
         run: |
           echo "💤 Keeping alive with heartbeat..."
           HEARTBEAT_ID="gha-$GITHUB_RUN_ID"

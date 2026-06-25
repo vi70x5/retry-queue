@@ -1,5 +1,3 @@
-// Animamesh — Phase 4 DHT Indexer
-// Spec: SPEC-V3-ANIMAMESH-BACKEND.md §14 (Phase 4: Optional DHT Indexer)
 //
 // A separately deployable long-lived process that:
 // - Maintains stable DHT connectivity (full server mode, NOT client mode)
@@ -37,7 +35,6 @@ interface IndexerConfig {
 }
 
 function loadConfig(): IndexerConfig {
-	const networkId = env("NETWORK_ID", "animamesh-main")!;
 	const bootstrapPeers = parseList(env("BOOTSTRAP_PEERS", "[]"));
 	const publicKeyMap = parseKeyMap(env("MESH_PUBLIC_KEYS", "{}"));
 	const coordinatorUrl = env("COORDINATOR_URL");

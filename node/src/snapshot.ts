@@ -1,5 +1,3 @@
-// Animamesh — Signed snapshot creation and verification
-// Spec: SPEC-V3-ANIMAMESH-BACKEND.md §13 (Optional IPFS/IPNS Mirror)
 //
 // Creates SignedSnapshot objects for IPFS mirroring, and signs/verifies them
 // using the same canonical JSON + Ed25519 pattern as PublicProxyRecord signing.
@@ -17,7 +15,6 @@ import type { PublicProxyRecord, SignedSnapshot } from "./types.js";
  * Create an unsigned SignedSnapshot from a list of verified records.
  *
  * The snapshot captures:
- * - schema: always "animamesh.snapshot.v1"
  * - networkId: the mesh network identifier
  * - generatedAt: ISO-8601 timestamp of creation
  * - expiresAt: earliest record expiry, or generatedAt + 15 min as fallback
@@ -51,7 +48,6 @@ export function createSnapshot(
 	);
 
 	return {
-		schema: "animamesh.snapshot.v1",
 		networkId,
 		generatedAt,
 		expiresAt,

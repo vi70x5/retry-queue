@@ -1,5 +1,3 @@
-// Animamesh — IPFS HTTP API wrapper for publishing snapshots
-// Spec: SPEC-V3-ANIMAMESH-BACKEND.md §13 (Optional IPFS/IPNS Mirror)
 //
 // Thin wrapper around the IPFS HTTP API (default: http://127.0.0.1:5001).
 // Uses native fetch — no external IPFS SDK dependencies needed (Node 18+).

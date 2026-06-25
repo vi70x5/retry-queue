@@ -32,7 +32,6 @@ export function createPublicProxyRecord(
 	const expiresAt = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
 
 	const record: PublicProxyRecord = {
-		schema: "animamesh.proxy.v1",
 		networkId: config.networkId,
 		nodeId: createNodeId(
 			config.runContext?.repository ?? "",
@@ -136,7 +135,6 @@ export function isRecordExpired(record: PublicProxyRecord): boolean {
  */
 export function isRecordValid(record: PublicProxyRecord): boolean {
 	if (!record || typeof record !== "object") return false;
-	if (record.schema !== "animamesh.proxy.v1") return false;
 	if (typeof record.networkId !== "string" || !record.networkId) return false;
 	if (typeof record.nodeId !== "string" || !record.nodeId) return false;
 	if (record.protocol !== "vless" && record.protocol !== "hysteria2")
