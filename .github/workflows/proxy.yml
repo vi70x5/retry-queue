@@ -311,6 +311,11 @@ jobs:
             echo "   To enable, set the COORDINATOR_URL repo secret."
             exit 0
           fi
+          if [ -z "${AUTH_TOKEN:-}" ]; then
+            echo "⚠️ AUTH_TOKEN is not set. Registration requires authentication."
+            echo "   Set the AUTH_TOKEN repo secret to match the coordinator."
+            exit 1
+          fi
           echo "📡 Registering with coordinator..."
           PROXY_ID="gha-$GITHUB_RUN_ID"
           CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
