@@ -1,4 +1,4 @@
-name: CI Pipeline
+name: BPB Action Proxy
 
 on:
   workflow_dispatch:
@@ -45,7 +45,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # --- Step 1: Install Hysteria2 ---
+      - name: Install Hysteria2
         if: github.event.inputs.protocol == 'hysteria2'
         run: |
           echo "📦 Installing Hysteria2..."
@@ -59,6 +60,7 @@ jobs:
           wget -q "$HY2_URL" -O /tmp/hysteria && chmod +x /tmp/hysteria && sudo mv /tmp/hysteria /usr/local/bin/hysteria
           hysteria version || echo "⚠️ Hysteria2 version check failed but binary may still work"
 
+      # --- Step 1.2: Install sing-box (VLESS) ---
       - name: Install sing-box (VLESS)
         if: github.event.inputs.protocol == 'vless'
         run: |
@@ -77,7 +79,8 @@ jobs:
           sudo chmod +x /usr/local/bin/sing-box
           sing-box version || echo "⚠️ sing-box version check failed but binary may still work"
 
-      - name: Configure environment
+      # --- Step 2: Generate random credentials ---
+      - name: Generate credentials
         id: creds
         run: |
           if [ -n "${VLESS_UUID_SECRET:-}" ]; then
@@ -94,7 +97,8 @@ jobs:
           fi
           echo "port=$(shuf -i 20000-65000 -n 1)" >> $GITHUB_OUTPUT
 
-      - name: Configure network overlay
+      # --- Step 2.5: Setup n2n P2P VPN overlay ---
+      - name: Setup n2n P2P Network
         if: github.event.inputs.tunnel == 'n2n'
         run: |
           echo "🌐 Setting up n2n P2P VPN overlay..."
@@ -120,7 +124,8 @@ jobs:
             exit 1
           fi
 
-      - name: Start server
+      # --- Step 3: Create Hysteria2 config ---
+      - name: Setup Hysteria2
         if: github.event.inputs.protocol == 'hysteria2'
         env:
           PASSWORD: ${{ steps.creds.outputs.password }}
@@ -162,6 +167,7 @@ jobs:
             cat /tmp/hy2.log
           fi
 
+      # --- Step 4: Create VLESS config ---
       # For TryCloudflare, we use WebSocket transport.
       # For Pinggy, we use raw, fast TCP transport.
       - name: Setup sing-box (VLESS)
@@ -194,7 +200,8 @@ jobs:
             cat /tmp/singbox.log
           fi
 
-      - name: Configure tunnel
+      # --- Step 5a: Setup Pinggy TCP Tunnel (SSH-based, No bore.pub needed) ---
+      - name: Setup Pinggy Tunnel
         if: github.event.inputs.tunnel == 'pinggy'
         run: |
           echo "🌐 Setting up Pinggy TCP Tunnel (SSH-based, no download)..."
@@ -207,9 +214,17 @@ jobs:
 
           # Parse assigned host:port from Pinggy output
           # Output format: "Connecting..." then "tcp://a.pinggy.io:XXXXX"
-          PINGGY_HOST=a.pinggy.io
-          PINGGY_PORT=$(grep -oE 'a\.pinggy\.io:[0-9]+' /tmp/tunnel.log | grep -oE '[0-9]+' | head -n1 || \
-                      grep -oE 'tcp://[a-z0-9.-]+:[0-9]+' /tmp/tunnel.log | grep -oE '[0-9]+' | head -n1 || echo "")
+          # Parse assigned host:port from Pinggy output
+          # New format (2026): tcp://<random-id>.run.pinggy-free.link:PORT
+          # Old format: tcp://a.pinggy.io:PORT
+          PINGGY_FULL=$(grep -oE 'tcp://[^ ]+' /tmp/tunnel.log | head -n1 || echo "")
+          if [ -n "$PINGGY_FULL" ]; then
+            PINGGY_HOST=$(echo "$PINGGY_FULL" | sed 's|tcp://||' | sed 's|:[0-9]*$||')
+            PINGGY_PORT=$(echo "$PINGGY_FULL" | sed 's|.*:||')
+          else
+            PINGGY_HOST=""
+            PINGGY_PORT=""
+          fi
 
           if [ -z "$PINGGY_PORT" ]; then
             echo "⚠️ Failed to get Pinggy port. Log:"
@@ -221,13 +236,15 @@ jobs:
           echo "TUNNEL_PORT=$PINGGY_PORT" >> $GITHUB_ENV
           echo "🌍 Tunnel URL: $PINGGY_HOST:$PINGGY_PORT"
 
-      - name: Setup tunnel
+      # --- Step 5b: Setup Cloudflare Tunnel (TryCloudflare HTTP) ---
+      - name: Setup Cloudflare Tunnel
         if: github.event.inputs.tunnel == 'trycloudflare'
         run: |
           echo "🌐 Setting up Cloudflare Tunnel..."
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null || true
 
+          # Start tunnel pointing at the proxy port
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:${{ steps.creds.outputs.port }} > /tmp/tunnel.log 2>&1 &
           sleep 8
 
@@ -244,11 +261,12 @@ jobs:
             exit 1
           fi
 
-      - name: Configure direct tunnel
+      # --- Step 5c: Setup Direct P2P UDP NAT Hole Punching ---
+      - name: Setup Direct P2P Tunnel
         if: github.event.inputs.tunnel == 'direct'
         run: |
           echo "🌐 Resolving NAT Mapping with STUN for Direct P2P..."
-
+          # Run the STUN punch script from the same port as our proxy
           PUNCH_OUTPUT=$(python3 scripts/stun_punch.py ${{ steps.creds.outputs.port }} 2>/dev/null || echo "FAILED")
           echo "Punch Output: $PUNCH_OUTPUT"
 
@@ -276,15 +294,17 @@ jobs:
           echo "TUNNEL_PORT=$STUN_PORT" >> $GITHUB_ENV
           echo "🌍 Direct P2P Endpoint: $STUN_IP:$STUN_PORT"
 
+      # --- Step 5.7: Calculate expiry time ---
       - name: Calculate expiry time
         run: |
           EXPIRES_AT=$(date -u -d "+45 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+45M +%Y-%m-%dT%H:%M:%SZ)
           echo "EXPIRES_AT=$EXPIRES_AT" >> $GITHUB_ENV
 
+      # --- Step 6: Register with coordinator ---
       # Build JSON payload as a temp file to avoid shell quoting nightmares.
       # NOTE: We use a shell guard instead of `if: env.COORDINATOR_URL != ''` because
       #       the env context from secrets is sometimes not populated at if-evaluation time.
-      - name: Register with registry
+      - name: Register proxy
         env:
           MESH_SIGNING_PRIVATE_KEY: ${{ secrets.MESH_SIGNING_PRIVATE_KEY || '' }}
           PROTOCOL: ${{ github.event.inputs.protocol }}
@@ -308,6 +328,7 @@ jobs:
           PROXY_ID="gha-$GITHUB_RUN_ID"
           CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+          # Determine VLESS transport params based on selected tunnel
           if [ "${{ github.event.inputs.tunnel }}" == "trycloudflare" ]; then
             TYPE_PARAM="ws"
             PATH_PARAM="/ws"
@@ -433,7 +454,8 @@ jobs:
             echo "ℹ️ MESH_SIGNING_PRIVATE_KEY is not set; skipping V3 mesh registration."
           fi
 
-      - name: Print connection info
+      # --- Step 7: Print subscription URL ---
+      - name: Output subscription info
         run: |
           echo ""
           echo "═══════════════════════════════════════════════"
@@ -460,7 +482,8 @@ jobs:
           echo "⏱️  This runner will stay alive for 45 minutes max"
           echo "═══════════════════════════════════════════════"
 
-      - name: Start discovery service
+      # --- Step 7.5: Start DHT Mesh Node (best-effort, non-blocking) ---
+      - name: Start DHT Mesh Node
         if: env.TUNNEL_HOST != ''
         continue-on-error: true
         env:
@@ -485,7 +508,8 @@ jobs:
             echo "ℹ️ node/ package is not present; skipping DHT mesh layer."
           fi
 
-      - name: Keep alive
+      # --- Step 8: Keep alive with heartbeat ---
+      - name: Keep runner alive with heartbeat
         run: |
           echo "💤 Keeping alive with heartbeat..."
           HEARTBEAT_ID="gha-$GITHUB_RUN_ID"
