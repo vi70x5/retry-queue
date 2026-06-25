@@ -12,12 +12,12 @@ on:
           - vless
           - hysteria2
       tunnel:
-        description: "Tunnel provider (Pinggy=raw TCP via SSH, TryCloudflare=HTTP/WS, Direct=P2P NAT, N2N=P2P VPN overlay)"
+        description: "Tunnel provider (serveo=SSH TCP relay, trycloudflare=HTTP/WS via Cloudflare, direct=STUN P2P, n2n=P2P VPN overlay)"
         required: true
-        default: "pinggy"
+        default: "serveo"
         type: choice
         options:
-          - pinggy
+          - serveo
           - trycloudflare
           - direct
           - n2n
@@ -169,7 +169,7 @@ jobs:
 
       # --- Step 4: Create VLESS config ---
       # For TryCloudflare, we use WebSocket transport.
-      # For Pinggy, we use raw, fast TCP transport.
+      # For Serveo/n2n/direct tunnels, use raw TCP transport.
       - name: Setup sing-box (VLESS)
         if: github.event.inputs.protocol == 'vless'
         env:
@@ -200,41 +200,44 @@ jobs:
             cat /tmp/singbox.log
           fi
 
-      # --- Step 5a: Setup Pinggy TCP Tunnel (SSH-based, No bore.pub needed) ---
-      - name: Setup Pinggy Tunnel
-        if: github.event.inputs.tunnel == 'pinggy'
+      # --- Step 5a: Setup Serveo TCP Tunnel (SSH-based, no binary download) ---
+      - name: Setup Serveo Tunnel
+        if: github.event.inputs.tunnel == 'serveo'
         run: |
-          echo "🌐 Setting up Pinggy TCP Tunnel (SSH-based, no download)..."
+          echo "🌐 Setting up Serveo TCP Tunnel (SSH-based, no download)..."
 
-          # Pinggy uses SSH — already available on ubuntu-latest
-          # -R0:localhost:PORT = request a random TCP port on the relay
-          # tcp@a.pinggy.io = Pinggy TCP relay server
-          nohup ssh -o StrictHostKeyChecking=no -p 443 -R0:localhost:${{ steps.creds.outputs.port }} tcp@a.pinggy.io > /tmp/tunnel.log 2>&1 &
-          sleep 8
+          # Serveo uses SSH — already available on ubuntu-latest
+          # -R PORT:localhost:PORT = request a random subdomain forwarding TCP to local port
+          # serveo.net = free SSH TCP relay (no account needed for ephemeral)
+          nohup ssh -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -R 80:localhost:${{ steps.creds.outputs.port }} \
+            serveo.net > /tmp/tunnel.log 2>&1 &
+          sleep 10
 
-          # Parse assigned host:port from Pinggy output
-          # Output format: "Connecting..." then "tcp://a.pinggy.io:XXXXX"
-          # Parse assigned host:port from Pinggy output
-          # New format (2026): tcp://<random-id>.run.pinggy-free.link:PORT
-          # Old format: tcp://a.pinggy.io:PORT
-          PINGGY_FULL=$(grep -oE 'tcp://[^ ]+' /tmp/tunnel.log | head -n1 || echo "")
-          if [ -n "$PINGGY_FULL" ]; then
-            PINGGY_HOST=$(echo "$PINGGY_FULL" | sed 's|tcp://||' | sed 's|:[0-9]*$||')
-            PINGGY_PORT=$(echo "$PINGGY_FULL" | sed 's|.*:||')
-          else
-            PINGGY_HOST=""
-            PINGGY_PORT=""
-          fi
+          # Parse assigned host:port from Serveo output
+          # Output format: "Forwarding HTTP traffic from https://<subdomain>.serveo.net"
+          # TCP forwarding: "Forwarding TCP traffic from serveo.net:PORT"
+          SERVEO_HOST=$(grep -oE 'serveo\.net:[0-9]+' /tmp/tunnel.log | head -n1 || \
+                        grep -oE '[a-z0-9]+\.serveo\.net' /tmp/tunnel.log | head -n1 || echo "")
+          SERVEO_PORT=$(grep -oE 'serveo\.net:[0-9]+' /tmp/tunnel.log | grep -oE '[0-9]+' | head -n1 || echo "80")
 
-          if [ -z "$PINGGY_PORT" ]; then
-            echo "⚠️ Failed to get Pinggy port. Log:"
+          if [ -z "$SERVEO_HOST" ]; then
+            echo "⚠️ Failed to get Serveo endpoint. Log:"
             cat /tmp/tunnel.log
             exit 1
           fi
 
-          echo "TUNNEL_HOST=$PINGGY_HOST" >> $GITHUB_ENV
-          echo "TUNNEL_PORT=$PINGGY_PORT" >> $GITHUB_ENV
-          echo "🌍 Tunnel URL: $PINGGY_HOST:$PINGGY_PORT"
+          if [ "$SERVEO_PORT" = "80" ]; then
+            # HTTP forwarding - subdomain style
+            echo "TUNNEL_HOST=$SERVEO_HOST" >> $GITHUB_ENV
+            echo "TUNNEL_PORT=443" >> $GITHUB_ENV
+            echo "🌍 Tunnel URL: https://$SERVEO_HOST"
+          else
+            echo "TUNNEL_HOST=serveo.net" >> $GITHUB_ENV
+            echo "TUNNEL_PORT=$SERVEO_PORT" >> $GITHUB_ENV
+            echo "🌍 Tunnel URL: serveo.net:$SERVEO_PORT"
+          fi
 
       # --- Step 5b: Setup Cloudflare Tunnel (TryCloudflare HTTP) ---
       - name: Setup Cloudflare Tunnel
@@ -393,7 +396,7 @@ jobs:
             .update(`${process.env.GITHUB_REPOSITORY}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}:${protocol}:${host}`)
             .digest("hex");
           const ingress =
-            tunnel === "trycloudflare" ? "cloudflared_quick" : tunnel === "n2n" ? "n2n" : tunnel === "pinggy" ? "pinggy" : "direct";
+            tunnel === "trycloudflare" ? "cloudflared_quick" : tunnel === "n2n" ? "n2n" : tunnel === "serveo" ? "serveo" : "direct"
           const transport = protocol === "vless" ? process.env.TYPE_PARAM : undefined;
           const path = protocol === "vless" && process.env.PATH_PARAM ? process.env.PATH_PARAM : undefined;
           const security = process.env.SECURITY_PARAM || (tunnel === "trycloudflare" ? "tls" : "none");
