@@ -207,36 +207,36 @@ jobs:
           echo "🌐 Setting up Serveo TCP Tunnel (SSH-based, no download)..."
 
           # Serveo uses SSH — already available on ubuntu-latest
-          # -R PORT:localhost:PORT = request a random subdomain forwarding TCP to local port
-          # serveo.net = free SSH TCP relay (no account needed for ephemeral)
+          # -R 0:localhost:PORT = request a random TCP port on the relay
+          # serveo.net = free SSH TCP relay
           nohup ssh -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 \
-            -R 80:localhost:${{ steps.creds.outputs.port }} \
+            -R 0:localhost:${{ steps.creds.outputs.port }} \
             serveo.net > /tmp/tunnel.log 2>&1 &
           sleep 10
 
-          # Parse assigned host:port from Serveo output
-          # Output format: "Forwarding HTTP traffic from https://<subdomain>.serveo.net"
-          # TCP forwarding: "Forwarding TCP traffic from serveo.net:PORT"
-          SERVEO_HOST=$(grep -oE 'serveo\.net:[0-9]+' /tmp/tunnel.log | head -n1 || \
-                        grep -oE '[a-z0-9]+\.serveo\.net' /tmp/tunnel.log | head -n1 || echo "")
-          SERVEO_PORT=$(grep -oE 'serveo\.net:[0-9]+' /tmp/tunnel.log | grep -oE '[0-9]+' | head -n1 || echo "80")
-
-          if [ -z "$SERVEO_HOST" ]; then
-            echo "⚠️ Failed to get Serveo endpoint. Log:"
-            cat /tmp/tunnel.log
-            exit 1
-          fi
-
-          if [ "$SERVEO_PORT" = "80" ]; then
-            # HTTP forwarding - subdomain style
-            echo "TUNNEL_HOST=$SERVEO_HOST" >> $GITHUB_ENV
-            echo "TUNNEL_PORT=443" >> $GITHUB_ENV
-            echo "🌍 Tunnel URL: https://$SERVEO_HOST"
+          # Parse assigned TCP port from Serveo output
+          # Format: "Forwarding TCP traffic from serveo.net:PORT"
+          SERVEO_PORT=$(grep -oE 'serveo\.net:[0-9]+' /tmp/tunnel.log | grep -oE '[0-9]+' | head -n1 || echo "")
+          # Fallback: HTTP subdomain format (serveousercontent.com)
+          if [ -z "$SERVEO_PORT" ]; then
+            SERVEO_HOST=$(grep -oE 'https://[a-z0-9-]+\.serveousercontent\.com' /tmp/tunnel.log | head -n1 || echo "")
+            if [ -n "$SERVEO_HOST" ]; then
+              SERVEO_HOST=$(echo "$SERVEO_HOST" | sed 's|https://||')
+              echo "TUNNEL_HOST=$SERVEO_HOST" >> $GITHUB_ENV
+              echo "TUNNEL_PORT=443" >> $GITHUB_ENV
+              echo "🌍 Tunnel URL: https://$SERVEO_HOST"
+            fi
           else
             echo "TUNNEL_HOST=serveo.net" >> $GITHUB_ENV
             echo "TUNNEL_PORT=$SERVEO_PORT" >> $GITHUB_ENV
             echo "🌍 Tunnel URL: serveo.net:$SERVEO_PORT"
+          fi
+
+          if [ -z "$SERVEO_PORT" ] && [ -z "$SERVEO_HOST" ]; then
+            echo "⚠️ Failed to get Serveo endpoint. Log:"
+            cat /tmp/tunnel.log
+            exit 1
           fi
 
       # --- Step 5b: Setup Cloudflare Tunnel (TryCloudflare HTTP) ---
